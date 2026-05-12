@@ -26,6 +26,7 @@
 
 #include "macdrv.h"
 #include "winuser.h"
+#include "ntuser.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(image);
 
@@ -296,4 +297,124 @@ CFArrayRef create_app_icon_images(void)
     }
 
     return images;
+}
+
+
+/***********************************************************************
+ *              free_image_bits
+ */
+static void free_image_bits(struct gdi_image_bits *bits)
+{
+    free(bits->ptr);
+}
+
+
+/***********************************************************************
+ *              macdrv_GetImage
+ *
+ * Intercept GDI BitBlt reads from window DCs.  Wine's in-memory surface
+ * buffer is never updated by Metal/DXVK rendering (which goes through
+ * CAMetalLayer), so naively reading the GDI DC yields black pixels.
+ * Instead, we capture the composited window content via
+ * CGWindowListCreateImage and return that to the caller.
+ */
+DWORD macdrv_GetImage(PHYSDEV dev, BITMAPINFO *info,
+                      struct gdi_image_bits *bits, struct bitblt_coords *src)
+{
+    HWND hwnd;
+    struct macdrv_win_data *data;
+    CGWindowID wid;
+    RECT win_rect;
+    CGImageRef cgimage = NULL;
+    DWORD ret = ERROR_NOT_SUPPORTED;
+    int req_w, req_h;
+
+    hwnd = NtUserWindowFromDC(dev->hdc);
+    if (!hwnd) goto fallback;
+
+    data = get_win_data(hwnd);
+    if (!data || !data->cocoa_window)
+    {
+        release_win_data(data);
+        goto fallback;
+    }
+
+    wid      = macdrv_get_cgwindow_id(data->cocoa_window);
+    win_rect = data->rects.window;
+    release_win_data(data);
+
+    if (!wid) goto fallback;
+
+    req_w = src->visrect.right  - src->visrect.left;
+    req_h = src->visrect.bottom - src->visrect.top;
+    if (req_w <= 0 || req_h <= 0) goto fallback;
+
+    /* Capture the composited window (Metal layer included) */
+    cgimage = CGWindowListCreateImage(CGRectNull,
+        kCGWindowListOptionIncludingWindow | kCGWindowListExcludeDesktopElements,
+        wid, kCGWindowImageDefault);
+    if (!cgimage) goto fallback;
+
+    /* Crop to the requested visrect if it doesn't cover the whole window */
+    {
+        int cx = src->visrect.left - win_rect.left;
+        int cy = src->visrect.top  - win_rect.top;
+        int iw = (int)CGImageGetWidth(cgimage);
+        int ih = (int)CGImageGetHeight(cgimage);
+
+        if (cx > 0 || cy > 0 || req_w < iw || req_h < ih)
+        {
+            CGRect crop = CGRectMake(cx < 0 ? 0 : cx, cy < 0 ? 0 : cy,
+                                     req_w, req_h);
+            CGImageRef cropped = CGImageCreateWithImageInRect(cgimage, crop);
+            CGImageRelease(cgimage);
+            cgimage = cropped;
+            if (!cgimage) goto fallback;
+        }
+    }
+
+    {
+        int width  = (int)CGImageGetWidth(cgimage);
+        int height = (int)CGImageGetHeight(cgimage);
+
+        info->bmiHeader.biSize          = sizeof(info->bmiHeader);
+        info->bmiHeader.biWidth         = width;
+        info->bmiHeader.biHeight        = -height;  /* top-down DIB */
+        info->bmiHeader.biPlanes        = 1;
+        info->bmiHeader.biBitCount      = 32;
+        info->bmiHeader.biCompression   = BI_RGB;
+        info->bmiHeader.biSizeImage     = width * height * 4;
+        info->bmiHeader.biXPelsPerMeter = 0;
+        info->bmiHeader.biYPelsPerMeter = 0;
+        info->bmiHeader.biClrUsed       = 0;
+        info->bmiHeader.biClrImportant  = 0;
+
+        if (!bits) { ret = ERROR_SUCCESS; goto done; }  /* info-only query */
+
+        {
+            CGDataProviderRef provider = CGImageGetDataProvider(cgimage);
+            CFDataRef cfdata = CGDataProviderCopyData(provider);
+            if (!cfdata) goto done;
+
+            void *buf = malloc((size_t)(width * height * 4));
+            if (buf)
+            {
+                memcpy(buf, CFDataGetBytePtr(cfdata), (size_t)(width * height * 4));
+                bits->ptr     = buf;
+                bits->is_copy = TRUE;
+                bits->free    = free_image_bits;
+                ret = ERROR_SUCCESS;
+            }
+            CFRelease(cfdata);
+        }
+    }
+
+done:
+    CGImageRelease(cgimage);
+    return ret;
+
+fallback:
+    if (cgimage) CGImageRelease(cgimage);
+    dev = GET_NEXT_PHYSDEV(dev, pGetImage);
+    return dev->funcs->pGetImage(dev, info, bits, src);
 }

@@ -4095,3 +4095,19 @@ void macdrv_clear_ime_text(void)
             [[window contentView] clearMarkedText];
     });
 }
+
+
+/***********************************************************************
+ *              macdrv_get_cgwindow_id
+ *
+ * Return the CGWindowID (Quartz window number) for a macdrv_window.
+ * Used by macdrv_GetImage to capture Metal-rendered content via
+ * CGWindowListCreateImage.
+ */
+CGWindowID macdrv_get_cgwindow_id(macdrv_window w)
+{
+    WineWindow *window = (WineWindow *)w;
+    __block CGWindowID wid = 0;
+    OnMainThread(^{ wid = (CGWindowID)[window windowNumber]; });
+    return wid;
+}
