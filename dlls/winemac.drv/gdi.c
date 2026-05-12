@@ -262,6 +262,7 @@ static const struct user_driver_funcs macdrv_funcs =
     .dc_funcs.pDeleteDC = macdrv_DeleteDC,
     .dc_funcs.pGetDeviceCaps = macdrv_GetDeviceCaps,
     .dc_funcs.pGetDeviceGammaRamp = macdrv_GetDeviceGammaRamp,
+    .dc_funcs.pGetImage = macdrv_GetImage,
     .dc_funcs.pSetDeviceGammaRamp = macdrv_SetDeviceGammaRamp,
     .dc_funcs.priority = GDI_PRIORITY_GRAPHICS_DRV,
 

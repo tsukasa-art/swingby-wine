@@ -87,6 +87,7 @@ extern CGRect macdrv_get_desktop_rect(void);
 extern void macdrv_reset_device_metrics(void);
 extern BOOL macdrv_GetDeviceGammaRamp(PHYSDEV dev, LPVOID ramp);
 extern BOOL macdrv_SetDeviceGammaRamp(PHYSDEV dev, LPVOID ramp);
+extern DWORD macdrv_GetImage(PHYSDEV dev, BITMAPINFO *info, struct gdi_image_bits *bits, struct bitblt_coords *src);
 
 
 /**************************************************************************

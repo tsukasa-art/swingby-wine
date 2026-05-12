@@ -552,6 +552,7 @@ extern void macdrv_set_window_shape(macdrv_window w, const CGRect *rects, int co
 extern void macdrv_set_window_alpha(macdrv_window w, CGFloat alpha);
 extern void macdrv_window_use_per_pixel_alpha(macdrv_window w, int use_per_pixel_alpha);
 extern void macdrv_give_cocoa_window_focus(macdrv_window w, int activate);
+extern CGWindowID macdrv_get_cgwindow_id(macdrv_window w);
 extern void macdrv_set_window_min_max_sizes(macdrv_window w, CGSize min_size, CGSize max_size);
 extern macdrv_view macdrv_create_view(CGRect rect);
 extern void macdrv_dispose_view(macdrv_view v);
