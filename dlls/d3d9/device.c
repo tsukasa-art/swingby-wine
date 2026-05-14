@@ -26,6 +26,10 @@ WINE_DEFAULT_DEBUG_CHANNEL(d3d9);
 
 static void STDMETHODCALLTYPE d3d9_null_wined3d_object_destroyed(void *parent) {}
 
+/* Set to ~120 by surface.c whenever a 192x108 LockRect fires (save screen open).
+ * Decremented each Present; auto-capture is paused while this is non-zero. */
+UINT wukiyo_save_screen_cooldown = 0;
+
 const struct wined3d_parent_ops d3d9_null_wined3d_parent_ops =
 {
     d3d9_null_wined3d_object_destroyed,
@@ -1267,6 +1271,8 @@ static HRESULT WINAPI DECLSPEC_HOTPATCH d3d9_device_Present(IDirect3DDevice9Ex *
     if (dirty_region)
         FIXME("Ignoring dirty_region %p.\n", dirty_region);
 
+    wukiyo_capture_frontbuffer(iface, device);
+
     wined3d_mutex_lock();
     for (i = 0; i < device->implicit_swapchain_count; ++i)
     {
@@ -1279,8 +1285,6 @@ static HRESULT WINAPI DECLSPEC_HOTPATCH d3d9_device_Present(IDirect3DDevice9Ex *
         }
     }
     wined3d_mutex_unlock();
-
-    wukiyo_capture_frontbuffer(iface, device);
     return D3D_OK;
 }
 
@@ -2154,40 +2158,66 @@ static HRESULT WINAPI d3d9_device_CreateOffscreenPlainSurface(IDirect3DDevice9Ex
             WINED3D_MULTISAMPLE_NONE, 0, usage, 0, access, width, height, user_mem, surface);
 }
 
-/* Capture the front buffer to /tmp/wukiyo_snap.bgra when trigger file exists.
- * Uses GetFrontBufferData which internally uses CG capture on Metal — bypasses compositor
- * visibility issues that plague screencapture -R/-l for Wine Metal windows. */
+/* Capture the back buffer to /tmp/wukiyo_snap.bgra.
+ * Runs automatically every 60 Present calls (~1 s at 60 fps) so the snap is
+ * always a recent game frame without requiring the user to press a button.
+ * Also fires immediately when the trigger file wukiyo_take_snap exists
+ * (camera button path). */
 static void wukiyo_capture_frontbuffer(IDirect3DDevice9Ex *iface, struct d3d9_device *device)
 {
     static const char snap_trigger[] = "Z:\\tmp\\wukiyo_take_snap";
     static const char snap_out[]     = "Z:\\tmp\\wukiyo_snap.bgra";
     static const char snap_ready[]   = "Z:\\tmp\\wukiyo_snap_ready";
+    static UINT auto_frame = 0;
     IDirect3DSurface9 *bb = NULL, *sys = NULL;
     D3DSURFACE_DESC desc;
     D3DLOCKED_RECT lr;
+    HRESULT hr;
     FILE *f;
     UINT row;
+    BOOL is_trigger;
 
-    { FILE *t = fopen(snap_trigger, "rb"); if (!t) return; fclose(t); }
-    remove(snap_trigger);
-    { FILE *lg = fopen("Z:\\tmp\\wukiyo_cap_dbg.txt", "a");
-      if (lg) { fprintf(lg, "capture triggered sc_count=%u\n", device->implicit_swapchain_count); fclose(lg); } }
+    { FILE *t = fopen(snap_trigger, "rb");
+      if (t) { fclose(t); remove(snap_trigger); is_trigger = TRUE; auto_frame = 0; }
+      else {
+          /* Pause auto-capture while the save screen is open (192x108 LockRects firing).
+           * wukiyo_save_screen_cooldown is set to 120 by surface.c on each 192x108 LockRect
+           * and decays here; when it reaches 0 the save screen has been closed for ~2 s. */
+          if (wukiyo_save_screen_cooldown > 0) { wukiyo_save_screen_cooldown--; return; }
+          if (++auto_frame < 60) return;
+          auto_frame = 0; is_trigger = FALSE;
+      } }
 
     if (!device->implicit_swapchain_count) return;
 
-    if (FAILED(d3d9_device_GetBackBuffer(iface, 0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) return;
+    if (FAILED(d3d9_device_GetBackBuffer(iface, 0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)))
+        return;
     IDirect3DSurface9_GetDesc(bb, &desc);
-    IDirect3DSurface9_Release(bb);
 
     if (FAILED(d3d9_device_CreateOffscreenPlainSurface(iface, desc.Width, desc.Height,
-            D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &sys, NULL))) return;
+            desc.Format, D3DPOOL_SYSTEMMEM, &sys, NULL)))
+    {
+        IDirect3DSurface9_Release(bb);
+        return;
+    }
 
-    { HRESULT gfb_hr = d3d9_device_GetFrontBufferData(iface, 0, sys);
-      { FILE *lg = fopen("Z:\\tmp\\wukiyo_cap_dbg.txt", "a");
-        if (lg) { fprintf(lg, "GetFrontBufferData hr=%08lx w=%u h=%u\n", gfb_hr, desc.Width, desc.Height); fclose(lg); } }
-      if (FAILED(gfb_hr)) { IDirect3DSurface9_Release(sys); return; } }
+    /* wined3d_device_context_blt reads directly from GPU memory; avoids the
+     * GetRenderTargetData hook that uses the CG compositor path (which sees
+     * through Wine's Metal window to the desktop behind it). */
+    { struct d3d9_surface *bb_impl  = unsafe_impl_from_IDirect3DSurface9(bb);
+      struct d3d9_surface *sys_impl = unsafe_impl_from_IDirect3DSurface9(sys);
+      RECT r;
+      SetRect(&r, 0, 0, desc.Width, desc.Height);
+      wined3d_mutex_lock();
+      hr = wined3d_device_context_blt(device->immediate_context,
+              sys_impl->wined3d_texture, sys_impl->sub_resource_idx, &r,
+              bb_impl->wined3d_texture,  bb_impl->sub_resource_idx,  &r,
+              0, NULL, WINED3D_TEXF_POINT);
+      wined3d_mutex_unlock(); }
+    IDirect3DSurface9_Release(bb);
+    if (FAILED(hr)) { IDirect3DSurface9_Release(sys); return; }
 
-    if (SUCCEEDED(IDirect3DSurface9_LockRect(sys, &lr, NULL, 0)))
+    if (SUCCEEDED(IDirect3DSurface9_LockRect(sys, &lr, NULL, D3DLOCK_READONLY)))
     {
         f = fopen(snap_out, "wb");
         if (f)
@@ -2199,7 +2229,7 @@ static void wukiyo_capture_frontbuffer(IDirect3DDevice9Ex *iface, struct d3d9_de
             for (row = 0; row < desc.Height; row++)
                 fwrite((char *)lr.pBits + (size_t)row * lr.Pitch, desc.Width * 4, 1, f);
             fclose(f);
-            f = fopen(snap_ready, "wb"); if (f) fclose(f);
+            if (is_trigger) { f = fopen(snap_ready, "wb"); if (f) fclose(f); }
         }
         IDirect3DSurface9_UnlockRect(sys);
     }
@@ -4285,6 +4315,8 @@ static HRESULT WINAPI DECLSPEC_HOTPATCH d3d9_device_PresentEx(IDirect3DDevice9Ex
     if (dirty_region)
         FIXME("Ignoring dirty_region %p.\n", dirty_region);
 
+    wukiyo_capture_frontbuffer(iface, device);
+
     wined3d_mutex_lock();
     for (i = 0; i < device->implicit_swapchain_count; ++i)
     {
@@ -4297,8 +4329,6 @@ static HRESULT WINAPI DECLSPEC_HOTPATCH d3d9_device_PresentEx(IDirect3DDevice9Ex
         }
     }
     wined3d_mutex_unlock();
-
-    wukiyo_capture_frontbuffer(iface, device);
     return D3D_OK;
 }
 

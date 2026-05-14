@@ -245,7 +245,16 @@ static HRESULT WINAPI d3d9_surface_GetDesc(IDirect3DSurface9 *iface, D3DSURFACE_
  *   /tmp/wukiyo_snap.bgra          – fallback: most recent screenshot (persistent)
  *   /tmp/wukiyo_snap_NNN.bgra      – per-slot snap for slot NNN (written at save time)
  *   /tmp/wukiyo_page_base.txt      – first slot number of the current save-screen page
+ *   /tmp/wukiyo_inject_dat_path.txt – Windows path to the .dat file just saved
  */
+
+/* stb_image_write: single-header JPEG encoder (public domain). */
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STBI_WRITE_NO_STDIO   /* use callback only, no fopen inside stb */
+#include "stb_image_write.h"
+
+/* Shared with device.c: pauses auto-capture while save screen is open. */
+extern UINT wukiyo_save_screen_cooldown;
 
 static void wukiyo_free_pix_cache(void); /* forward declaration */
 
@@ -389,23 +398,162 @@ void wukiyo_on_get_render_target_data(IDirect3DSurface9 *src, IDirect3DSurface9 
       if (lg) { fprintf(lg,"getrtdata_set pending=dst=%p\n",(void*)dst); fclose(lg); } }
 }
 
-/* Inject the per-slot snap (wukiyo_snap_NNN.bgra) into the locked surface buffer. */
-static void wukiyo_inject_snap_slot(void *data, unsigned int row_pitch, int slot)
+/* Inject the per-slot snap (wukiyo_snap_NNN.bgra) into the locked surface buffer.
+ * Tries /tmp first (live session), then ~/Library/Application Support/Wukiyo/snaps/
+ * for persistence across reboots.
+ * Returns 1 if a snap was found and blitted, 0 otherwise. */
+static int wukiyo_inject_snap_slot(void *data, unsigned int row_pitch, int slot)
 {
-    char         path[64];
+    char         path[512];
     BYTE        *px = NULL;
     unsigned int fw, fh, fstride;
+
+    /* 1. Try /tmp (live session). */
     snprintf(path, sizeof(path), "Z:\\tmp\\wukiyo_snap_%03d.bgra", slot);
     if (wukiyo_load_snap_file(path, &px, &fw, &fh, &fstride))
+    {
         wukiyo_blit(data, row_pitch, px, fw, fh, fstride);
+        return 1;
+    }
+
+    /* 2. Fall back to persistent path (~/.wukiyo_snaps/). */
+    {
+        const char *home = getenv("HOME");
+        if (home)
+        {
+            snprintf(path, sizeof(path), "%s/.wukiyo_snaps/wukiyo_snap_%03d.bgra", home, slot);
+            if (wukiyo_load_snap_file(path, &px, &fw, &fh, &fstride))
+            {
+                wukiyo_blit(data, row_pitch, px, fw, fh, fstride);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* ---------- .dat file thumbnail patching (persistence) ----------
+ * Called once after inject fires. Reads wukiyo_snap.bgra, scales to 192×108,
+ * encodes as JPEG, and overwrites the thumbnail region in the save .dat file.
+ * The .dat Windows path is read from wukiyo_inject_dat_path.txt.
+ */
+
+static unsigned char s_jpeg_buf[16384];
+static int           s_jpeg_buf_len;
+
+static void wukiyo_jpeg_cb(void *ctx, void *data, int size)
+{
+    (void)ctx;
+    if (s_jpeg_buf_len + size <= (int)sizeof(s_jpeg_buf))
+    {
+        memcpy(s_jpeg_buf + s_jpeg_buf_len, data, size);
+        s_jpeg_buf_len += size;
+    }
+}
+
+static void wukiyo_patch_dat_file(int slot)
+{
+    static const char snap_path[]    = "Z:\\tmp\\wukiyo_snap.bgra";
+    static const char dat_key_path[] = "Z:\\tmp\\wukiyo_inject_dat_path.txt";
+    static const int  JPEG_REGION    = 9131;
+    static const int  SUFFIX         = 74684;
+
+    FILE         *f;
+    UINT32        fw, fh, fstride;
+    BYTE         *raw = NULL;
+    size_t        raw_size;
+    unsigned char rgb[192 * 108 * 3];
+    char          dat_path[1024];
+    long          dat_size;
+    int           jpeg_offset, dy, dx, n;
+
+    dat_path[0] = '\0';
+
+    /* 1. Read snap.bgra header */
+    f = fopen(snap_path, "rb");
+    if (!f) { FILE *lg = fopen("Z:\\tmp\\wukiyo_patch_dbg.txt","w");
+              if (lg){fprintf(lg,"no snap\n");fclose(lg);} return; }
+    if (fread(&fw,4,1,f)!=1 || fread(&fh,4,1,f)!=1 || fread(&fstride,4,1,f)!=1
+        || fw==0 || fh==0 || fstride < fw*4)
+    { fclose(f); return; }
+    raw_size = (size_t)fh * fstride;
+    raw = HeapAlloc(GetProcessHeap(), 0, raw_size);
+    if (!raw || fread(raw, fstride, fh, f) != fh) { fclose(f); HeapFree(GetProcessHeap(),0,raw); return; }
+    fclose(f);
+
+    /* 2. Scale BGRA → 192×108 RGB */
+    for (dy = 0; dy < 108; dy++)
+    {
+        unsigned int sy = (unsigned int)((UINT64)dy * fh / 108);
+        const BYTE *src = raw + (SIZE_T)sy * fstride;
+        for (dx = 0; dx < 192; dx++)
+        {
+            unsigned int sx = (unsigned int)((UINT64)dx * fw / 192);
+            rgb[(dy*192+dx)*3+0] = src[sx*4+2]; /* R (swap from BGRA) */
+            rgb[(dy*192+dx)*3+1] = src[sx*4+1]; /* G */
+            rgb[(dy*192+dx)*3+2] = src[sx*4+0]; /* B (swap from BGRA) */
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, raw);
+
+    /* 3. Encode JPEG, try quality levels until ≤ JPEG_REGION bytes */
+    {
+        int q;
+        s_jpeg_buf_len = 0;
+        for (q = 85; q >= 25; q -= 15)
+        {
+            s_jpeg_buf_len = 0;
+            stbi_write_jpg_to_func(wukiyo_jpeg_cb, NULL, 192, 108, 3, rgb, q);
+            if (s_jpeg_buf_len > 0 && s_jpeg_buf_len <= JPEG_REGION) break;
+        }
+        if (s_jpeg_buf_len == 0 || s_jpeg_buf_len > JPEG_REGION) return;
+        /* Pad to exactly JPEG_REGION (zeros after JPEG EOI are ignored by decoders) */
+        memset(s_jpeg_buf + s_jpeg_buf_len, 0, JPEG_REGION - s_jpeg_buf_len);
+    }
+
+    /* 4. Get .dat file path: prefer Wukiyo-provided override, else derive from exe path */
+    f = fopen(dat_key_path, "r");
+    if (f)
+    {
+        if (fgets(dat_path, sizeof(dat_path), f))
+        {
+            n = (int)strlen(dat_path);
+            while (n > 0 && (dat_path[n-1]=='\n'||dat_path[n-1]=='\r'||dat_path[n-1]==' ')) dat_path[--n]='\0';
+        }
+        fclose(f);
+    }
+    if (!dat_path[0])
+    {
+        /* Fallback: game exe is in <dir>\, saves are in <dir>\save\save%03d.dat */
+        char exe_buf[512]; char *sep;
+        if (GetModuleFileNameA(NULL, exe_buf, sizeof(exe_buf)) && (sep = strrchr(exe_buf, '\\')))
+        {
+            *sep = '\0';
+            snprintf(dat_path, sizeof(dat_path), "%s\\save\\save%03d.dat", exe_buf, slot);
+        }
+    }
+    if (!dat_path[0]) { FILE *lg = fopen("Z:\\tmp\\wukiyo_patch_dbg.txt","w");
+                        if (lg){fprintf(lg,"no dat path\n");fclose(lg);} return; }
+
+    /* 5. Open .dat, overwrite thumbnail region */
+    f = fopen(dat_path, "r+b");
+    if (!f) { FILE *lg = fopen("Z:\\tmp\\wukiyo_patch_dbg.txt","w");
+              if (lg){fprintf(lg,"fopen failed: %s\n",dat_path);fclose(lg);} return; }
+    fseek(f, 0, SEEK_END);
+    dat_size = ftell(f);
+    jpeg_offset = (int)dat_size - JPEG_REGION - SUFFIX;
+    if (jpeg_offset < 0) { fclose(f); return; }
+    fseek(f, jpeg_offset, SEEK_SET);
+    fwrite(s_jpeg_buf, 1, JPEG_REGION, f);
+    fclose(f);
+
+    { FILE *lg = fopen("Z:\\tmp\\wukiyo_patch_dbg.txt","w");
+      if (lg){fprintf(lg,"patch OK: %s offset=%d jpeg=%d bytes\n",dat_path,jpeg_offset,s_jpeg_buf_len);fclose(lg);} }
 }
 
 /* State for counter-based 192x108 thumbnail injection. */
 static DWORD              s_192_last_tick    = 0;
 static int                s_192_counter      = 0;
-static int                s_inject_at        = -1;
-static int                s_inject_slot      = -1;
-static LONGLONG           s_slot_file_time   = 0;
 /* Pending UnlockRect injection: write snap AFTER game fills the surface. */
 static IDirect3DSurface9 *s_unlock_iface     = NULL;
 static void              *s_unlock_data      = NULL;
@@ -433,7 +581,7 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
         locked_rect->Pitch = map_desc.row_pitch;
         locked_rect->pBits = map_desc.data;
 
-        /* Counter-based injection: fire when the N-th 192x108 LockRect of a sequence matches. */
+        /* Counter-based injection: schedule snap inject for EVERY 192x108 slot on screen. */
         if (map_desc.data)
         {
             struct wined3d_sub_resource_desc _d;
@@ -444,49 +592,39 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
                 DWORD now = GetTickCount();
                 BOOL  new_seq = (s_192_last_tick == 0 || (DWORD)(now - s_192_last_tick) > 2000);
                 s_192_last_tick = now;
-
-                /* Check if inject_slot.txt was written/updated since last read (mtime-based). */
-                {
-                    WIN32_FILE_ATTRIBUTE_DATA fa;
-                    if (GetFileAttributesExA("Z:\\tmp\\wukiyo_inject_slot.txt",
-                                             GetFileExInfoStandard, &fa))
-                    {
-                        LONGLONG ft = ((LONGLONG)fa.ftLastWriteTime.dwHighDateTime << 32)
-                                    | fa.ftLastWriteTime.dwLowDateTime;
-                        if (ft != s_slot_file_time)
-                        {
-                            /* New save detected: read target and reset counter. */
-                            FILE *sf = fopen("Z:\\tmp\\wukiyo_inject_slot.txt", "r");
-                            if (sf)
-                            {
-                                int slot, pb;
-                                if (fscanf(sf, "%d %d", &slot, &pb) == 2)
-                                {
-                                    s_inject_at      = slot - pb;
-                                    s_inject_slot    = slot;
-                                    s_slot_file_time = ft;
-                                    s_192_counter    = 0;
-                                    new_seq          = FALSE; /* counter already reset */
-                                }
-                                fclose(sf);
-                            }
-                        }
-                    }
-                }
+                /* Tell device.c to pause auto-capture: save screen is open. */
+                wukiyo_save_screen_cooldown = 120;
 
                 if (new_seq)
-                    s_192_counter = 0;
-
-                if (s_inject_at >= 0 && s_192_counter == s_inject_at)
                 {
-                    /* Defer: store pointer so UnlockRect can inject AFTER game writes. */
+                    unsigned int pb = 0;
+                    FILE *pf = fopen("Z:\\tmp\\wukiyo_page_base.txt", "rb");
+                    if (!pf)
+                    {
+                        /* Fall back to persistent path if /tmp was cleared after reboot. */
+                        const char *home = getenv("HOME");
+                        if (home)
+                        {
+                            char pbpath[512];
+                            snprintf(pbpath, sizeof(pbpath), "%s/.wukiyo_snaps/page_base.txt", home);
+                            pf = fopen(pbpath, "rb");
+                        }
+                    }
+                    if (pf) { fscanf(pf, "%u", &pb); fclose(pf); }
+                    s_reg_page_base = pb;
+                    s_192_counter = 0;
+                    /* Reset inject_fired log on new sequence. */
+                    { FILE *lg = fopen("Z:\\tmp\\wukiyo_inject_fired.txt","w");
+                      if (lg) { fprintf(lg,"page_base=%u\n", pb); fclose(lg); } }
+                }
+
+                /* Schedule inject for every slot position within the page (first 18). */
+                if (s_192_counter < 18)
+                {
                     s_unlock_iface = iface;
                     s_unlock_data  = map_desc.data;
                     s_unlock_pitch = map_desc.row_pitch;
-                    s_unlock_slot  = s_inject_slot;
-                    s_inject_at      = -1;
-                    s_slot_file_time = 0;
-                    DeleteFileA("Z:\\tmp\\wukiyo_inject_slot.txt");
+                    s_unlock_slot  = (int)(s_reg_page_base + s_192_counter);
                 }
                 s_192_counter++;
             }
@@ -508,9 +646,12 @@ static HRESULT WINAPI d3d9_surface_UnlockRect(IDirect3DSurface9 *iface)
     /* Inject snap AFTER game has written its thumbnail data, before unmap. */
     if (iface == s_unlock_iface && s_unlock_data != NULL)
     {
-        wukiyo_inject_snap_slot(s_unlock_data, s_unlock_pitch, s_unlock_slot);
-        { FILE *lg = fopen("Z:\\tmp\\wukiyo_inject_fired.txt","w");
-          if (lg) { fprintf(lg,"injected slot=%d\n", s_unlock_slot); fclose(lg); } }
+        int injected = wukiyo_inject_snap_slot(s_unlock_data, s_unlock_pitch, s_unlock_slot);
+        if (injected)
+        {
+            FILE *lg = fopen("Z:\\tmp\\wukiyo_inject_fired.txt","a");
+            if (lg) { fprintf(lg,"slot=%d ok\n", s_unlock_slot); fclose(lg); }
+        }
         s_unlock_iface = NULL;
         s_unlock_data  = NULL;
     }
