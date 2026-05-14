@@ -248,11 +248,6 @@ static HRESULT WINAPI d3d9_surface_GetDesc(IDirect3DSurface9 *iface, D3DSURFACE_
  *   /tmp/wukiyo_inject_dat_path.txt – Windows path to the .dat file just saved
  */
 
-/* stb_image_write: single-header JPEG encoder (public domain). */
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#define STBI_WRITE_NO_STDIO   /* use callback only, no fopen inside stb */
-#include "stb_image_write.h"
-
 /* Shared with device.c: pauses auto-capture while save screen is open. */
 extern UINT wukiyo_save_screen_cooldown;
 
@@ -433,122 +428,293 @@ static int wukiyo_inject_snap_slot(void *data, unsigned int row_pitch, int slot)
 }
 
 /* ---------- .dat file thumbnail patching (persistence) ----------
- * Called once after inject fires. Reads wukiyo_snap.bgra, scales to 192×108,
- * encodes as JPEG, and overwrites the thumbnail region in the save .dat file.
- * The .dat Windows path is read from wukiyo_inject_dat_path.txt.
+ * Called after inject fires.  Builds a 192x108 24-bpp bottom-up BMP from the
+ * per-slot BGRA snap, LZSS-compresses it (all-literal mode), and rewrites
+ * blob 1 of the CSV2 save container.  The .dat Windows path is read from
+ * wukiyo_inject_dat_path.txt.  Format details: re/FINDINGS.md.
+ *
+ * The patch runs on a worker thread (CreateThread) — render-thread hooks
+ * must never block on file I/O.
  */
 
-static unsigned char s_jpeg_buf[16384];
-static int           s_jpeg_buf_len;
+#define WUKIYO_BMP_W           192
+#define WUKIYO_BMP_H           108
+#define WUKIYO_BMP_PIX_BYTES   (WUKIYO_BMP_W * WUKIYO_BMP_H * 3)   /* 62208 */
+#define WUKIYO_BMP_TOTAL_BYTES (54 + WUKIYO_BMP_PIX_BYTES)         /* 62262 */
 
-static void wukiyo_jpeg_cb(void *ctx, void *data, int size)
+/* LZSS all-literal encoder (same ring-buffer variant as FUN_140068210).
+ * Flag byte with n bits set followed by n literal bytes; ~12% overhead. */
+static unsigned char *wukiyo_lzss_all_literal(const unsigned char *src,
+                                              size_t src_len, size_t *out_len)
 {
-    (void)ctx;
-    if (s_jpeg_buf_len + size <= (int)sizeof(s_jpeg_buf))
+    size_t cap = src_len + (src_len / 8) + 8;
+    unsigned char *out = HeapAlloc(GetProcessHeap(), 0, cap);
+    size_t i = 0, o = 0, n;
+
+    if (!out) { *out_len = 0; return NULL; }
+    while (i < src_len)
     {
-        memcpy(s_jpeg_buf + s_jpeg_buf_len, data, size);
-        s_jpeg_buf_len += size;
+        n = src_len - i;
+        if (n > 8) n = 8;
+        out[o++] = (unsigned char)((1u << n) - 1u);
+        memcpy(out + o, src + i, n);
+        o += n; i += n;
     }
+    *out_len = o;
+    return out;
 }
 
-static void wukiyo_patch_dat_file(int slot)
+/* Standalone BGRA snap loader (no shared cache — worker-thread safe). */
+static BOOL wukiyo_load_snap_uncached(const char *path,
+    BYTE **out_px, unsigned int *out_fw, unsigned int *out_fh, unsigned int *out_fstride)
 {
-    static const char snap_path[]    = "Z:\\tmp\\wukiyo_snap.bgra";
-    static const char dat_key_path[] = "Z:\\tmp\\wukiyo_inject_dat_path.txt";
-    static const int  JPEG_REGION    = 9131;
-    static const int  SUFFIX         = 74684;
-
-    FILE         *f;
-    UINT32        fw, fh, fstride;
-    BYTE         *raw = NULL;
-    size_t        raw_size;
-    unsigned char rgb[192 * 108 * 3];
-    char          dat_path[1024];
-    long          dat_size;
-    int           jpeg_offset, dy, dx, n;
-
-    dat_path[0] = '\0';
-
-    /* 1. Read snap.bgra header */
-    f = fopen(snap_path, "rb");
-    if (!f) { FILE *lg = fopen("Z:\\tmp\\wukiyo_patch_dbg.txt","w");
-              if (lg){fprintf(lg,"no snap\n");fclose(lg);} return; }
-    if (fread(&fw,4,1,f)!=1 || fread(&fh,4,1,f)!=1 || fread(&fstride,4,1,f)!=1
-        || fw==0 || fh==0 || fstride < fw*4)
-    { fclose(f); return; }
-    raw_size = (size_t)fh * fstride;
-    raw = HeapAlloc(GetProcessHeap(), 0, raw_size);
-    if (!raw || fread(raw, fstride, fh, f) != fh) { fclose(f); HeapFree(GetProcessHeap(),0,raw); return; }
+    unsigned int fw = 0, fh = 0, fstride = 0;
+    SIZE_T pix_size;
+    BYTE *px;
+    FILE *f = fopen(path, "rb");
+    if (!f) return FALSE;
+    if (fread(&fw,4,1,f) != 1 || fread(&fh,4,1,f) != 1 || fread(&fstride,4,1,f) != 1
+        || fw <= 1 || fh <= 1 || fstride < fw * 4)
+    { fclose(f); return FALSE; }
+    pix_size = (SIZE_T)fstride * fh;
+    px = HeapAlloc(GetProcessHeap(), 0, pix_size);
+    if (!px || fread(px, 1, pix_size, f) != pix_size)
+    {
+        if (px) HeapFree(GetProcessHeap(), 0, px);
+        fclose(f); return FALSE;
+    }
     fclose(f);
+    *out_px = px; *out_fw = fw; *out_fh = fh; *out_fstride = fstride;
+    return TRUE;
+}
 
-    /* 2. Scale BGRA → 192×108 RGB */
-    for (dy = 0; dy < 108; dy++)
+static void wukiyo_patch_dat_file_impl(int slot)
+{
+    static const char dat_key_path[] = "Z:\\tmp\\wukiyo_inject_dat_path.txt";
+
+    FILE         *f, *lg;
+    BYTE         *raw_px = NULL;
+    unsigned int  fw = 0, fh = 0, fstride = 0;
+    char          dat_path[1024] = {0};
+    char          snap_path[512];
+    BYTE         *dat = NULL, *new_dat = NULL, *bmp = NULL;
+    unsigned char *lzss = NULL;
+    long          dat_size = 0;
+    size_t        new_total, lzss_len = 0;
+    UINT32        cs0 = 0, cs1 = 0, cs2 = 0;
+    size_t        blob0_off, blob1_off, blob2_off, checksum_off;
+    int           dy, dx, n;
+    UINT32        v_u32;
+    INT32         v_i32;
+    UINT16        v_u16;
+
+    /* 1. Load per-slot snap.  /tmp first, then persistent fallback. */
+    snprintf(snap_path, sizeof(snap_path), "Z:\\tmp\\wukiyo_snap_%03d.bgra", slot);
+    if (!wukiyo_load_snap_uncached(snap_path, &raw_px, &fw, &fh, &fstride))
     {
-        unsigned int sy = (unsigned int)((UINT64)dy * fh / 108);
-        const BYTE *src = raw + (SIZE_T)sy * fstride;
-        for (dx = 0; dx < 192; dx++)
+        const char *home = getenv("HOME");
+        if (home)
         {
-            unsigned int sx = (unsigned int)((UINT64)dx * fw / 192);
-            rgb[(dy*192+dx)*3+0] = src[sx*4+2]; /* R (swap from BGRA) */
-            rgb[(dy*192+dx)*3+1] = src[sx*4+1]; /* G */
-            rgb[(dy*192+dx)*3+2] = src[sx*4+0]; /* B (swap from BGRA) */
+            snprintf(snap_path, sizeof(snap_path),
+                     "%s/.wukiyo_snaps/wukiyo_snap_%03d.bgra", home, slot);
+            if (!wukiyo_load_snap_uncached(snap_path, &raw_px, &fw, &fh, &fstride))
+                raw_px = NULL;
         }
     }
-    HeapFree(GetProcessHeap(), 0, raw);
-
-    /* 3. Encode JPEG, try quality levels until ≤ JPEG_REGION bytes */
+    if (!raw_px)
     {
-        int q;
-        s_jpeg_buf_len = 0;
-        for (q = 85; q >= 25; q -= 15)
-        {
-            s_jpeg_buf_len = 0;
-            stbi_write_jpg_to_func(wukiyo_jpeg_cb, NULL, 192, 108, 3, rgb, q);
-            if (s_jpeg_buf_len > 0 && s_jpeg_buf_len <= JPEG_REGION) break;
-        }
-        if (s_jpeg_buf_len == 0 || s_jpeg_buf_len > JPEG_REGION) return;
-        /* Pad to exactly JPEG_REGION (zeros after JPEG EOI are ignored by decoders) */
-        memset(s_jpeg_buf + s_jpeg_buf_len, 0, JPEG_REGION - s_jpeg_buf_len);
+        lg = fopen("Z:\\tmp\\wukiyo_patch_dbg.txt","w");
+        if (lg) { fprintf(lg,"no snap for slot %d\n", slot); fclose(lg); }
+        return;
     }
 
-    /* 4. Get .dat file path: prefer Wukiyo-provided override, else derive from exe path */
+    /* 2. Resolve .dat path. */
     f = fopen(dat_key_path, "r");
     if (f)
     {
         if (fgets(dat_path, sizeof(dat_path), f))
         {
             n = (int)strlen(dat_path);
-            while (n > 0 && (dat_path[n-1]=='\n'||dat_path[n-1]=='\r'||dat_path[n-1]==' ')) dat_path[--n]='\0';
+            while (n > 0 && (dat_path[n-1]=='\n'||dat_path[n-1]=='\r'||dat_path[n-1]==' '))
+                dat_path[--n] = '\0';
         }
         fclose(f);
     }
     if (!dat_path[0])
     {
-        /* Fallback: game exe is in <dir>\, saves are in <dir>\save\save%03d.dat */
         char exe_buf[512]; char *sep;
-        if (GetModuleFileNameA(NULL, exe_buf, sizeof(exe_buf)) && (sep = strrchr(exe_buf, '\\')))
+        if (GetModuleFileNameA(NULL, exe_buf, sizeof(exe_buf))
+            && (sep = strrchr(exe_buf, '\\')))
         {
             *sep = '\0';
             snprintf(dat_path, sizeof(dat_path), "%s\\save\\save%03d.dat", exe_buf, slot);
         }
     }
-    if (!dat_path[0]) { FILE *lg = fopen("Z:\\tmp\\wukiyo_patch_dbg.txt","w");
-                        if (lg){fprintf(lg,"no dat path\n");fclose(lg);} return; }
+    if (!dat_path[0])
+    {
+        lg = fopen("Z:\\tmp\\wukiyo_patch_dbg.txt","w");
+        if (lg) { fprintf(lg,"no dat path\n"); fclose(lg); }
+        HeapFree(GetProcessHeap(), 0, raw_px);
+        return;
+    }
 
-    /* 5. Open .dat, overwrite thumbnail region */
-    f = fopen(dat_path, "r+b");
-    if (!f) { FILE *lg = fopen("Z:\\tmp\\wukiyo_patch_dbg.txt","w");
-              if (lg){fprintf(lg,"fopen failed: %s\n",dat_path);fclose(lg);} return; }
+    /* 3. Read whole .dat file. */
+    f = fopen(dat_path, "rb");
+    if (!f)
+    {
+        lg = fopen("Z:\\tmp\\wukiyo_patch_dbg.txt","w");
+        if (lg) { fprintf(lg,"open failed: %s\n", dat_path); fclose(lg); }
+        HeapFree(GetProcessHeap(), 0, raw_px);
+        return;
+    }
     fseek(f, 0, SEEK_END);
     dat_size = ftell(f);
-    jpeg_offset = (int)dat_size - JPEG_REGION - SUFFIX;
-    if (jpeg_offset < 0) { fclose(f); return; }
-    fseek(f, jpeg_offset, SEEK_SET);
-    fwrite(s_jpeg_buf, 1, JPEG_REGION, f);
+    fseek(f, 0, SEEK_SET);
+    if (dat_size < 0x260
+        || !(dat = HeapAlloc(GetProcessHeap(), 0, (SIZE_T)dat_size))
+        || fread(dat, 1, dat_size, f) != (size_t)dat_size)
+    {
+        fclose(f);
+        if (dat) HeapFree(GetProcessHeap(), 0, dat);
+        HeapFree(GetProcessHeap(), 0, raw_px);
+        lg = fopen("Z:\\tmp\\wukiyo_patch_dbg.txt","w");
+        if (lg) { fprintf(lg,"read failed: %s sz=%ld\n", dat_path, dat_size); fclose(lg); }
+        return;
+    }
     fclose(f);
 
-    { FILE *lg = fopen("Z:\\tmp\\wukiyo_patch_dbg.txt","w");
-      if (lg){fprintf(lg,"patch OK: %s offset=%d jpeg=%d bytes\n",dat_path,jpeg_offset,s_jpeg_buf_len);fclose(lg);} }
+    /* 4. Validate magic and extract blob layout. */
+    if (dat[0] != 'C' || dat[1] != 'S' || dat[2] != 'V' || dat[3] != '2')
+    {
+        lg = fopen("Z:\\tmp\\wukiyo_patch_dbg.txt","w");
+        if (lg) { fprintf(lg,"not CSV2: %s\n", dat_path); fclose(lg); }
+        HeapFree(GetProcessHeap(), 0, dat);
+        HeapFree(GetProcessHeap(), 0, raw_px);
+        return;
+    }
+    memcpy(&cs0, dat + 0x230, 4);
+    memcpy(&cs1, dat + 0x234, 4);
+    memcpy(&cs2, dat + 0x238, 4);
+    blob0_off    = 0x258;
+    blob1_off    = blob0_off + cs0;
+    blob2_off    = blob1_off + cs1;
+    checksum_off = blob2_off + cs2;
+    if (checksum_off + 2 > (size_t)dat_size)
+    {
+        lg = fopen("Z:\\tmp\\wukiyo_patch_dbg.txt","w");
+        if (lg) { fprintf(lg,"layout OOB cs0=%u cs1=%u cs2=%u datsz=%ld\n",
+                              cs0, cs1, cs2, dat_size); fclose(lg); }
+        HeapFree(GetProcessHeap(), 0, dat);
+        HeapFree(GetProcessHeap(), 0, raw_px);
+        return;
+    }
+
+    /* 5. Build 192x108 24-bpp BMP (bottom-up BGR) from top-down BGRA snap.
+     * 192*3 = 576 bytes/row, already 4-byte aligned (no row padding needed). */
+    bmp = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, WUKIYO_BMP_TOTAL_BYTES);
+    if (!bmp)
+    {
+        HeapFree(GetProcessHeap(), 0, dat);
+        HeapFree(GetProcessHeap(), 0, raw_px);
+        return;
+    }
+
+    bmp[0] = 'B'; bmp[1] = 'M';
+    v_u32 = WUKIYO_BMP_TOTAL_BYTES; memcpy(bmp +  2, &v_u32, 4); /* file size */
+    /* reserved (offset 6, 4 bytes) = 0 */
+    v_u32 = 54;                     memcpy(bmp + 10, &v_u32, 4); /* pixel data offset */
+    v_u32 = 40;                     memcpy(bmp + 14, &v_u32, 4); /* DIB header size */
+    v_i32 = WUKIYO_BMP_W;           memcpy(bmp + 18, &v_i32, 4); /* width */
+    v_i32 = WUKIYO_BMP_H;           memcpy(bmp + 22, &v_i32, 4); /* height (positive = bottom-up) */
+    v_u16 = 1;                      memcpy(bmp + 26, &v_u16, 2); /* planes */
+    v_u16 = 24;                     memcpy(bmp + 28, &v_u16, 2); /* bpp */
+    /* compression (offset 30, BI_RGB = 0) already zero */
+    v_u32 = WUKIYO_BMP_PIX_BYTES;   memcpy(bmp + 34, &v_u32, 4); /* raw image size */
+    /* x/y ppm, colors_used, important_colors at 38..50 already zero */
+
+    /* BMP row r (0 = bottom) ← visual row (BMP_H-1-r), nearest-neighbor scaled. */
+    for (dy = 0; dy < WUKIYO_BMP_H; dy++)
+    {
+        unsigned int visual_row = (unsigned int)(WUKIYO_BMP_H - 1 - dy);
+        unsigned int sy = (unsigned int)((UINT64)visual_row * fh / WUKIYO_BMP_H);
+        const BYTE *src_row = raw_px + (SIZE_T)sy * fstride;
+        BYTE *dst_row = bmp + 54 + (SIZE_T)dy * (WUKIYO_BMP_W * 3);
+        for (dx = 0; dx < WUKIYO_BMP_W; dx++)
+        {
+            unsigned int sx = (unsigned int)((UINT64)dx * fw / WUKIYO_BMP_W);
+            const BYTE *sp = src_row + sx * 4;
+            BYTE *dp = dst_row + dx * 3;
+            dp[0] = sp[0]; /* B */
+            dp[1] = sp[1]; /* G */
+            dp[2] = sp[2]; /* R */
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, raw_px);
+
+    /* 6. LZSS-encode the BMP. */
+    lzss = wukiyo_lzss_all_literal(bmp, WUKIYO_BMP_TOTAL_BYTES, &lzss_len);
+    HeapFree(GetProcessHeap(), 0, bmp);
+    if (!lzss) { HeapFree(GetProcessHeap(), 0, dat); return; }
+
+    /* 7. Reassemble: 0x258 header + blob0 + new_blob1 + blob2 + 2-byte checksum. */
+    new_total = blob0_off + cs0 + lzss_len + cs2 + 2;
+    new_dat = HeapAlloc(GetProcessHeap(), 0, new_total);
+    if (!new_dat)
+    {
+        HeapFree(GetProcessHeap(), 0, lzss);
+        HeapFree(GetProcessHeap(), 0, dat);
+        return;
+    }
+    memcpy(new_dat, dat, blob0_off);
+
+    /* Header patches: total body size (0x21C), new blob-1 comp/raw (0x234/0x248). */
+    v_u32 = cs0 + (UINT32)lzss_len + cs2; memcpy(new_dat + 0x21C, &v_u32, 4);
+    v_u32 = (UINT32)lzss_len;             memcpy(new_dat + 0x234, &v_u32, 4);
+    v_u32 = (UINT32)WUKIYO_BMP_TOTAL_BYTES; memcpy(new_dat + 0x248, &v_u32, 4);
+
+    memcpy(new_dat + blob0_off,                       dat + blob0_off,    cs0);
+    memcpy(new_dat + blob0_off + cs0,                 lzss,               lzss_len);
+    memcpy(new_dat + blob0_off + cs0 + lzss_len,      dat + blob2_off,    cs2);
+    memcpy(new_dat + blob0_off + cs0 + lzss_len + cs2,
+                                                      dat + checksum_off, 2);
+
+    HeapFree(GetProcessHeap(), 0, lzss);
+
+    /* 8. Write back (full rewrite). */
+    f = fopen(dat_path, "wb");
+    if (!f)
+    {
+        lg = fopen("Z:\\tmp\\wukiyo_patch_dbg.txt","w");
+        if (lg) { fprintf(lg, "open-for-write failed: %s\n", dat_path); fclose(lg); }
+    }
+    else
+    {
+        size_t wrote = fwrite(new_dat, 1, new_total, f);
+        fclose(f);
+        lg = fopen("Z:\\tmp\\wukiyo_patch_dbg.txt","w");
+        if (lg) { fprintf(lg, "patch slot=%d %s old_cs1=%u new_cs1=%lu total=%lu wrote=%lu\n",
+                              slot, dat_path, cs1, (unsigned long)lzss_len, (unsigned long)new_total, (unsigned long)wrote); fclose(lg); }
+    }
+
+    HeapFree(GetProcessHeap(), 0, new_dat);
+    HeapFree(GetProcessHeap(), 0, dat);
+}
+
+/* Worker thread entry point — runs wukiyo_patch_dat_file_impl off the render thread. */
+static DWORD WINAPI wukiyo_patch_dat_thread(LPVOID arg)
+{
+    int slot = (int)(INT_PTR)arg;
+    wukiyo_patch_dat_file_impl(slot);
+    return 0;
+}
+
+/* Render-thread-safe entry point.  Spawns a worker and returns immediately. */
+static void wukiyo_patch_dat_file(int slot)
+{
+    HANDLE h;
+    if (slot < 0) return;
+    h = CreateThread(NULL, 0, wukiyo_patch_dat_thread, (LPVOID)(INT_PTR)slot, 0, NULL);
+    if (h) CloseHandle(h);
 }
 
 /* State for counter-based 192x108 thumbnail injection. */
@@ -593,7 +759,7 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
                 BOOL  new_seq = (s_192_last_tick == 0 || (DWORD)(now - s_192_last_tick) > 2000);
                 s_192_last_tick = now;
                 /* Tell device.c to pause auto-capture: save screen is open. */
-                wukiyo_save_screen_cooldown = 120;
+                wukiyo_save_screen_cooldown = 1800; /* ~30s at 60fps; keep paused while save screen is open */
 
                 if (new_seq)
                 {
@@ -643,7 +809,9 @@ static HRESULT WINAPI d3d9_surface_UnlockRect(IDirect3DSurface9 *iface)
 
     TRACE("iface %p.\n", iface);
 
-    /* Inject snap AFTER game has written its thumbnail data, before unmap. */
+    /* Inject snap AFTER game has written its thumbnail data, before unmap.
+     * .dat persistence is handled exclusively by the Swift side (patchDatFileThumbnail);
+     * this inject is live-preview only. */
     if (iface == s_unlock_iface && s_unlock_data != NULL)
     {
         int injected = wukiyo_inject_snap_slot(s_unlock_data, s_unlock_pitch, s_unlock_slot);

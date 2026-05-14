@@ -1947,6 +1947,36 @@ static HRESULT WINAPI d3d9_device_GetFrontBufferData(IDirect3DDevice9Ex *iface,
                 dst_impl->wined3d_texture, dst_impl->sub_resource_idx);
     wined3d_mutex_unlock();
 
+    /* Wukiyo: the CG compositor path returns the full macOS desktop (including other windows).
+     * Overwrite with wukiyo_snap.bgra which correctly contains only the game's own frame. */
+    if (SUCCEEDED(hr))
+    {
+        D3DLOCKED_RECT lr;
+        if (SUCCEEDED(IDirect3DSurface9_LockRect(dst_surface, &lr, NULL, 0)))
+        {
+            struct wined3d_sub_resource_desc desc;
+            wined3d_mutex_lock();
+            wined3d_texture_get_sub_resource_desc(dst_impl->wined3d_texture,
+                    dst_impl->sub_resource_idx, &desc);
+            wined3d_mutex_unlock();
+
+            FILE *snap_f = fopen("Z:\\tmp\\wukiyo_snap.bgra", "rb");
+            if (snap_f)
+            {
+                UINT row_bytes = desc.width * 4;
+                for (UINT y = 0; y < desc.height; y++)
+                {
+                    BYTE *dst_row = (BYTE *)lr.pBits + (LONG)y * lr.Pitch;
+                    if (fread(dst_row, 1, row_bytes, snap_f) < row_bytes) break;
+                }
+                fclose(snap_f);
+                { FILE *lg = fopen("Z:\\tmp\\wukiyo_stretch.txt","a");
+                  if (lg) { fprintf(lg,"GetFrontBuf intercepted %ux%u\n",desc.width,desc.height); fclose(lg); } }
+            }
+            IDirect3DSurface9_UnlockRect(dst_surface);
+        }
+    }
+
     return hr;
 }
 
@@ -1977,6 +2007,12 @@ static HRESULT WINAPI d3d9_device_StretchRect(IDirect3DDevice9Ex *iface, IDirect
         SetRect(&s, 0, 0, src_desc.width, src_desc.height);
         src_rect = &s;
     }
+
+    /* Wukiyo: log ALL StretchRect calls involving 192x108 (before pool checks reject them). */
+    if (dst_desc.width == 192 && dst_desc.height == 108)
+    { FILE *lg = fopen("Z:\\tmp\\wukiyo_stretch.txt","a");
+      if (lg) { fprintf(lg,"stretch192 src=%ux%u dst_access=0x%x src_access=0x%x\n",
+          src_desc.width,src_desc.height,dst_desc.access,src_desc.access); fclose(lg); } }
 
     if (dst_desc.access & WINED3D_RESOURCE_ACCESS_CPU)
     {
@@ -2026,6 +2062,20 @@ static HRESULT WINAPI d3d9_device_StretchRect(IDirect3DDevice9Ex *iface, IDirect
         }
     }
 
+    /* Wukiyo approach B: for thumbnail captures (dst=192x108), the normal GPU blit
+     * returns black on Metal. Use the CG compositor front-buffer path instead so the
+     * game gets the actual game frame and can write it to .dat itself. */
+    if (dst_desc.width == 192 && dst_desc.height == 108 && device->implicit_swapchain_count > 0)
+    {
+        HRESULT cg_hr = wined3d_swapchain_get_front_buffer_data(
+                device->implicit_swapchains[0], dst->wined3d_texture, dst->sub_resource_idx);
+        { FILE *lg = fopen("Z:\\tmp\\wukiyo_stretch.txt", "a");
+          if (lg) { fprintf(lg, "stretch192 cg_hr=0x%08x src=%ux%u dst=%ux%u\n",
+              (unsigned)cg_hr, src_desc.width, src_desc.height, dst_desc.width, dst_desc.height);
+            fclose(lg); } }
+        if (SUCCEEDED(cg_hr)) { hr = D3D_OK; goto done; }
+    }
+
     hr = wined3d_device_context_blt(device->immediate_context, dst->wined3d_texture,
             dst->sub_resource_idx, dst_rect, src->wined3d_texture, src->sub_resource_idx,
             src_rect, 0, NULL, wined3d_texture_filter_type_from_d3d(filter));
@@ -2033,13 +2083,6 @@ static HRESULT WINAPI d3d9_device_StretchRect(IDirect3DDevice9Ex *iface, IDirect
         hr = D3DERR_INVALIDCALL;
     if (SUCCEEDED(hr) && dst->texture)
         d3d9_texture_flag_auto_gen_mipmap(dst->texture);
-
-    /* Wukiyo: notify surface.c of StretchRect to 192x108 (stub; kept for ABI). */
-    if (SUCCEEDED(hr) && dst_desc.width == 192 && dst_desc.height == 108)
-    {
-        extern void wukiyo_on_stretchrect(IDirect3DSurface9 *dest);
-        wukiyo_on_stretchrect(dst_surface);
-    }
 
 done:
     wined3d_mutex_unlock();

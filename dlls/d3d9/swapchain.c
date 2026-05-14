@@ -158,6 +158,7 @@ static HRESULT WINAPI d3d9_swapchain_GetFrontBufferData(IDirect3DSwapChain9Ex *i
 {
     struct d3d9_swapchain *swapchain = impl_from_IDirect3DSwapChain9Ex(iface);
     struct d3d9_surface *dst = unsafe_impl_from_IDirect3DSurface9(surface);
+    struct wined3d_sub_resource_desc desc;
     HRESULT hr;
 
     TRACE("iface %p, surface %p.\n", iface, surface);
@@ -165,6 +166,31 @@ static HRESULT WINAPI d3d9_swapchain_GetFrontBufferData(IDirect3DSwapChain9Ex *i
     wined3d_mutex_lock();
     hr = wined3d_swapchain_get_front_buffer_data(swapchain->wined3d_swapchain, dst->wined3d_texture, dst->sub_resource_idx);
     wined3d_mutex_unlock();
+
+    /* Wukiyo: CG compositor path returns full macOS desktop; overwrite with game-frame snap. */
+    if (SUCCEEDED(hr))
+    {
+        D3DLOCKED_RECT lr;
+        if (SUCCEEDED(IDirect3DSurface9_LockRect(surface, &lr, NULL, 0)))
+        {
+            wined3d_mutex_lock();
+            wined3d_texture_get_sub_resource_desc(dst->wined3d_texture, dst->sub_resource_idx, &desc);
+            wined3d_mutex_unlock();
+            { FILE *snap_f = fopen("Z:\\tmp\\wukiyo_snap.bgra", "rb");
+              if (snap_f) {
+                UINT row_bytes = desc.width * 4; UINT y;
+                for (y = 0; y < desc.height; y++) {
+                    BYTE *dst_row = (BYTE *)lr.pBits + (LONG)y * lr.Pitch;
+                    if (fread(dst_row, 1, row_bytes, snap_f) < row_bytes) break;
+                }
+                fclose(snap_f);
+                { FILE *lg = fopen("Z:\\tmp\\wukiyo_stretch.txt","a");
+                  if (lg){fprintf(lg,"SwapChainGetFrontBuf intercepted %ux%u\n",desc.width,desc.height);fclose(lg);} }
+              }
+            }
+            IDirect3DSurface9_UnlockRect(surface);
+        }
+    }
 
     return hr;
 }
