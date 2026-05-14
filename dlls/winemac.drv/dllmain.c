@@ -405,6 +405,18 @@ static BOOL process_attach(void)
     return TRUE;
 }
 
+void WINAPI WineMacCaptureWindowPixelsBGRA(HWND hwnd, void *buf,
+        unsigned int w, unsigned int h, unsigned int row_pitch)
+{
+    struct capture_window_pixels_params params;
+    params.hwnd      = (UINT_PTR)hwnd;
+    params.buf       = (UINT_PTR)buf;
+    params.w         = w;
+    params.h         = h;
+    params.row_pitch = row_pitch;
+    MACDRV_CALL(capture_window_pixels, &params);
+}
+
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
 {
     if (reason != DLL_PROCESS_ATTACH) return TRUE;

@@ -235,22 +235,47 @@ HRESULT CDECL wined3d_swapchain_present(struct wined3d_swapchain *swapchain,
 HRESULT CDECL wined3d_swapchain_get_front_buffer_data(const struct wined3d_swapchain *swapchain,
         struct wined3d_texture *dst_texture, unsigned int sub_resource_idx)
 {
+    struct wined3d_texture *front = swapchain->front_buffer;
     RECT src_rect, dst_rect;
 
     TRACE("swapchain %p, dst_texture %p, sub_resource_idx %u.\n", swapchain, dst_texture, sub_resource_idx);
 
-    SetRect(&src_rect, 0, 0, swapchain->front_buffer->resource.width, swapchain->front_buffer->resource.height);
+    SetRect(&src_rect, 0, 0, front->resource.width, front->resource.height);
     dst_rect = src_rect;
 
-    if (swapchain->state.desc.windowed)
+    /* On Metal-backed OpenGL, GL readback always returns black. Do an on-demand
+     * CG screen capture right now (before any save menu appears) so we get the
+     * actual composited game scene, then write it directly to dst SYSMEM. */
     {
-        MapWindowPoints(swapchain->win_handle, NULL, (POINT *)&dst_rect, 2);
-        FIXME("Using destination rect %s in windowed mode, this is likely wrong.\n",
-                wine_dbgstr_rect(&dst_rect));
+        typedef void (WINAPI *CAPTURE_FN)(HWND, void *, unsigned int, unsigned int, unsigned int);
+        static CAPTURE_FN cg_capture = (CAPTURE_FN)(intptr_t)-1;
+
+        if (cg_capture == (CAPTURE_FN)(intptr_t)-1)
+        {
+            HMODULE mac_drv = GetModuleHandleA("winemac.drv");
+            cg_capture = mac_drv ? (CAPTURE_FN)GetProcAddress(mac_drv, "WineMacCaptureWindowPixelsBGRA") : NULL;
+        }
+        if (cg_capture)
+        {
+            unsigned int w = wined3d_texture_get_level_width(dst_texture, 0);
+            unsigned int h = wined3d_texture_get_level_height(dst_texture, 0);
+            unsigned int row_pitch, slice_pitch;
+            wined3d_texture_get_pitch(dst_texture, 0, &row_pitch, &slice_pitch);
+
+            if (!dst_texture->resource.heap_memory)
+                wined3d_texture_prepare_location(dst_texture, sub_resource_idx, NULL, WINED3D_LOCATION_SYSMEM);
+            if (dst_texture->resource.heap_memory)
+            {
+                cg_capture(swapchain->win_handle, dst_texture->resource.heap_memory, w, h, row_pitch);
+                wined3d_texture_validate_location(dst_texture, sub_resource_idx, WINED3D_LOCATION_SYSMEM);
+                wined3d_texture_invalidate_location(dst_texture, sub_resource_idx, ~WINED3D_LOCATION_SYSMEM);
+                return WINED3D_OK;
+            }
+        }
     }
 
     return wined3d_device_context_blt(&swapchain->device->cs->c, dst_texture, sub_resource_idx, &dst_rect,
-            swapchain->front_buffer, 0, &src_rect, 0, NULL, WINED3D_TEXF_POINT);
+            front, 0, &src_rect, 0, NULL, WINED3D_TEXF_POINT);
 }
 
 struct wined3d_texture * CDECL wined3d_swapchain_get_back_buffer(const struct wined3d_swapchain *swapchain,
@@ -588,6 +613,7 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
     const struct wined3d_gl_info *gl_info;
     struct wined3d_context_gl *context_gl;
     struct wined3d_context *context;
+    BOOL cg_captured = FALSE;
 
     context = context_acquire(swapchain->device, swapchain->front_buffer, 0);
     context_gl = wined3d_context_gl(context);
@@ -615,6 +641,366 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
 
         wined3d_texture_load_location(back_buffer, 0, context, back_buffer->resource.draw_binding);
 
+        /* [GL capture removed: all GL readback paths return black on macOS Metal.
+         *  CG capture is done after wglSwapBuffers instead.] */
+        if (0) {
+            struct wined3d_texture_gl *back_gl = wined3d_texture_gl(back_buffer);
+            struct wined3d_texture *front = swapchain->front_buffer;
+            /* DEBUG: log state unconditionally on first call */
+            {
+                static int logged = 0;
+                if (!logged) {
+                    logged = 1;
+                    FILE *lf = fopen("/tmp/wined3d_state.log", "w");
+                    if (lf) {
+                        fprintf(lf, "back locations=0x%x TEXTURE_RGB=%x name_rgb=%u name_srgb=%u draw_binding=0x%x target=0x%x\n",
+                                back_buffer->sub_resources[0].locations,
+                                WINED3D_LOCATION_TEXTURE_RGB,
+                                back_gl->texture_rgb.name,
+                                back_gl->texture_srgb.name,
+                                back_buffer->resource.draw_binding,
+                                back_gl->target);
+                        fprintf(lf, "front locations=0x%x\n",
+                                front->sub_resources[0].locations);
+                        fclose(lf);
+                    }
+                }
+            }
+            if ((back_buffer->sub_resources[0].locations & WINED3D_LOCATION_TEXTURE_RGB)
+                    && back_gl->texture_rgb.name
+                    && wined3d_texture_prepare_location(front, 0, context, WINED3D_LOCATION_SYSMEM))
+            {
+                struct wined3d_bo_address snap;
+                wined3d_texture_get_bo_address(front, 0, &snap, WINED3D_LOCATION_SYSMEM);
+                if (!snap.buffer_object && snap.addr)
+                {
+                    const struct wined3d_format_gl *fmt_gl = wined3d_format_gl(front->resource.format);
+                    unsigned int w = wined3d_texture_get_level_width(front, 0);
+                    unsigned int h = wined3d_texture_get_level_height(front, 0);
+                    unsigned int row_pitch, slice_pitch;
+                    uint8_t *buf = snap.addr;
+
+                    wined3d_texture_get_pitch(front, 0, &row_pitch, &slice_pitch);
+
+                    /* On macOS Metal-backed OpenGL, all framebuffer-read paths
+                     * (glReadPixels, glCopyTexSubImage2D, glBlitFramebuffer) from
+                     * a GL_SRGB8_ALPHA8 FBO return RGB=0, A=255.  The only working
+                     * path is texture sampling in a fragment shader, which is what
+                     * swapchain_blit already uses to put the frame on screen. */
+                    {
+                        /* Shaders for a passthrough textured fullscreen quad. */
+                        static const char vs_src[] =
+                            "#version 150 core\n"
+                            "in vec2 a_pos;\n"
+                            "in vec2 a_tc;\n"
+                            "out vec2 v_uv;\n"
+                            "void main(){gl_Position=vec4(a_pos,0.0,1.0);v_uv=a_tc;}\n";
+                        static const char fs_src[] =
+                            "#version 150 core\n"
+                            "uniform sampler2D u_tex;\n"
+                            "in vec2 v_uv;\n"
+                            "out vec4 o_col;\n"
+                            "void main(){o_col=texture(u_tex,v_uv);}\n";
+                        /* Triangle strip covering NDC [-1,1]: pos(x,y) uv(u,v). */
+                        static const GLfloat quad[16] = {
+                            -1.0f, -1.0f,  0.0f, 0.0f,
+                             1.0f, -1.0f,  1.0f, 0.0f,
+                            -1.0f,  1.0f,  0.0f, 1.0f,
+                             1.0f,  1.0f,  1.0f, 1.0f,
+                        };
+
+                        GLuint vao, vbo, vs, fs, prog, dst_tex, dst_fbo;
+                        GLint prev_prog, prev_vao, prev_draw_fbo, prev_read_fbo;
+                        GLint prev_active_tex, prev_tex0, prev_vp[4];
+                        GLboolean prev_depth, prev_blend, prev_cull, prev_srgb;
+                        GLenum dst_status;
+                        const char *p;
+
+                        /* Save state that we will modify. */
+                        gl_info->gl_ops.gl.p_glGetIntegerv(GL_CURRENT_PROGRAM,           &prev_prog);
+                        gl_info->gl_ops.gl.p_glGetIntegerv(GL_VERTEX_ARRAY_BINDING,      &prev_vao);
+                        gl_info->gl_ops.gl.p_glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING,  &prev_draw_fbo);
+                        gl_info->gl_ops.gl.p_glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING,  &prev_read_fbo);
+                        gl_info->gl_ops.gl.p_glGetIntegerv(GL_VIEWPORT,                  prev_vp);
+                        gl_info->gl_ops.gl.p_glGetIntegerv(GL_ACTIVE_TEXTURE,            &prev_active_tex);
+                        GL_EXTCALL(glActiveTexture(GL_TEXTURE0));
+                        gl_info->gl_ops.gl.p_glGetIntegerv(GL_TEXTURE_BINDING_2D,        &prev_tex0);
+                        prev_depth = gl_info->gl_ops.gl.p_glIsEnabled(GL_DEPTH_TEST);
+                        prev_blend = gl_info->gl_ops.gl.p_glIsEnabled(GL_BLEND);
+                        prev_cull  = gl_info->gl_ops.gl.p_glIsEnabled(GL_CULL_FACE);
+                        prev_srgb  = gl_info->gl_ops.gl.p_glIsEnabled(GL_FRAMEBUFFER_SRGB);
+
+                        gl_info->gl_ops.gl.p_glFinish();
+
+                        /* Build destination GL_RGBA8 texture + FBO. */
+                        gl_info->gl_ops.gl.p_glGenTextures(1, &dst_tex);
+                        gl_info->gl_ops.gl.p_glBindTexture(GL_TEXTURE_2D, dst_tex);
+                        gl_info->gl_ops.gl.p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
+                                w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+                        gl_info->gl_ops.gl.p_glTexParameteri(GL_TEXTURE_2D,
+                                GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                        gl_info->gl_ops.gl.p_glTexParameteri(GL_TEXTURE_2D,
+                                GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                        GL_EXTCALL(glGenFramebuffers(1, &dst_fbo));
+                        GL_EXTCALL(glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst_fbo));
+                        GL_EXTCALL(glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,
+                                GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dst_tex, 0));
+                        dst_status = GL_EXTCALL(glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER));
+
+                        if (dst_status == GL_FRAMEBUFFER_COMPLETE)
+                        {
+                            /* Compile passthrough shader. */
+                            p = vs_src;
+                            vs = GL_EXTCALL(glCreateShader(GL_VERTEX_SHADER));
+                            GL_EXTCALL(glShaderSource(vs, 1, &p, NULL));
+                            GL_EXTCALL(glCompileShader(vs));
+                            p = fs_src;
+                            fs = GL_EXTCALL(glCreateShader(GL_FRAGMENT_SHADER));
+                            GL_EXTCALL(glShaderSource(fs, 1, &p, NULL));
+                            GL_EXTCALL(glCompileShader(fs));
+                            prog = GL_EXTCALL(glCreateProgram());
+                            GL_EXTCALL(glAttachShader(prog, vs));
+                            GL_EXTCALL(glAttachShader(prog, fs));
+                            GL_EXTCALL(glBindAttribLocation(prog, 0, "a_pos"));
+                            GL_EXTCALL(glBindAttribLocation(prog, 1, "a_tc"));
+                            GL_EXTCALL(glLinkProgram(prog));
+                            {
+                                static int link_logged = 0;
+                                if (!link_logged)
+                                {
+                                    GLint link_ok = 0;
+                                    link_logged = 1;
+                                    GL_EXTCALL(glGetProgramiv(prog, GL_LINK_STATUS, &link_ok));
+                                    {
+                                        char log_buf[512] = {0};
+                                        FILE *dlf = fopen("/tmp/wined3d_shader.log", "w");
+                                        GL_EXTCALL(glGetProgramInfoLog(prog, sizeof(log_buf),
+                                                NULL, log_buf));
+                                        if (dlf) {
+                                            fprintf(dlf, "link_ok=%d info=%s\n",
+                                                    link_ok, log_buf);
+                                            fclose(dlf);
+                                        }
+                                    }
+                                }
+                            }
+                            GL_EXTCALL(glUseProgram(prog));
+                            {
+                                GLint tex_loc = GL_EXTCALL(glGetUniformLocation(prog, "u_tex"));
+                                GL_EXTCALL(glUniform1i(tex_loc, 0));
+                            }
+
+                            /* Try texture_srgb if it exists, else texture_rgb. */
+#ifndef GL_TEXTURE_SRGB_DECODE_EXT
+#define GL_TEXTURE_SRGB_DECODE_EXT 0x8A48
+#define GL_SKIP_DECODE_EXT         0x8A4A
+#define GL_DECODE_EXT              0x8A49
+#endif
+                            {
+                                GLuint tex_name = back_gl->texture_srgb.name
+                                        ? back_gl->texture_srgb.name
+                                        : back_gl->texture_rgb.name;
+                                static int src_logged = 0;
+                                if (!src_logged) {
+                                    src_logged = 1;
+                                    FILE *sf = fopen("/tmp/wined3d_shader.log", "a");
+                                    if (sf) {
+                                        fprintf(sf, "using tex=%u (srgb=%u rgb=%u)\n",
+                                                tex_name, back_gl->texture_srgb.name,
+                                                back_gl->texture_rgb.name);
+                                        fclose(sf);
+                                    }
+                                }
+                                GL_EXTCALL(glActiveTexture(GL_TEXTURE0));
+                                gl_info->gl_ops.gl.p_glBindTexture(back_gl->target, tex_name);
+                                gl_info->gl_ops.gl.p_glTexParameteri(back_gl->target,
+                                        GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                                gl_info->gl_ops.gl.p_glTexParameteri(back_gl->target,
+                                        GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                                gl_info->gl_ops.gl.p_glTexParameteri(back_gl->target,
+                                        GL_TEXTURE_SRGB_DECODE_EXT, GL_SKIP_DECODE_EXT);
+                            }
+                            gl_info->gl_ops.gl.p_glDisable(GL_FRAMEBUFFER_SRGB);
+
+                            /* Fullscreen quad VBO + VAO. */
+                            GL_EXTCALL(glGenVertexArrays(1, &vao));
+                            GL_EXTCALL(glBindVertexArray(vao));
+                            GL_EXTCALL(glGenBuffers(1, &vbo));
+                            GL_EXTCALL(glBindBuffer(GL_ARRAY_BUFFER, vbo));
+                            GL_EXTCALL(glBufferData(GL_ARRAY_BUFFER,
+                                    sizeof(quad), quad, GL_STREAM_DRAW));
+                            GL_EXTCALL(glEnableVertexAttribArray(0));
+                            GL_EXTCALL(glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE,
+                                    4 * sizeof(GLfloat), (void *)0));
+                            GL_EXTCALL(glEnableVertexAttribArray(1));
+                            GL_EXTCALL(glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE,
+                                    4 * sizeof(GLfloat),
+                                    (void *)(2 * sizeof(GLfloat))));
+
+                            gl_info->gl_ops.gl.p_glDisable(GL_DEPTH_TEST);
+                            gl_info->gl_ops.gl.p_glDisable(GL_BLEND);
+                            gl_info->gl_ops.gl.p_glDisable(GL_CULL_FACE);
+                            gl_info->gl_ops.gl.p_glViewport(0, 0, w, h);
+
+                            /* Draw the quad into the RGBA8 FBO. */
+                            gl_info->gl_ops.gl.p_glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                            gl_info->gl_ops.gl.p_glFinish();
+
+                            /* Read back – BGRA is Metal's native layout for RGBA8. */
+                            GL_EXTCALL(glBindFramebuffer(GL_READ_FRAMEBUFFER, dst_fbo));
+                            gl_info->gl_ops.gl.p_glReadBuffer(GL_COLOR_ATTACHMENT0);
+                            {
+                                static int px_logged = 0;
+                                if (!px_logged)
+                                {
+                                    uint8_t px[4] = {0xAA, 0xAA, 0xAA, 0xAA};
+                                    px_logged = 1;
+                                    gl_info->gl_ops.gl.p_glReadPixels(w/2, h/2, 1, 1,
+                                            GL_BGRA, GL_UNSIGNED_BYTE, px);
+                                    {
+                                        FILE *pf = fopen("/tmp/wined3d_shader.log", "a");
+                                        if (pf) {
+                                            fprintf(pf,
+                                                "center BGRA=[%u,%u,%u,%u] tex=%u\n",
+                                                px[0], px[1], px[2], px[3],
+                                                back_gl->texture_rgb.name);
+                                            fclose(pf);
+                                        }
+                                    }
+                                }
+                            }
+                            /* Diagnostic: glGetTexImage directly on the source texture.
+                             * Different backing-store path than FBO readback. */
+                            {
+                                static int gti_logged = 0;
+                                if (!gti_logged)
+                                {
+                                    uint8_t *gti_buf = malloc(w * h * 4);
+                                    gti_logged = 1;
+                                    if (gti_buf)
+                                    {
+                                        GLuint src_name = back_gl->texture_srgb.name
+                                                ? back_gl->texture_srgb.name
+                                                : back_gl->texture_rgb.name;
+                                        gl_info->gl_ops.gl.p_glBindTexture(back_gl->target, src_name);
+                                        gl_info->gl_ops.gl.p_glGetTexImage(back_gl->target, 0,
+                                                GL_BGRA, GL_UNSIGNED_BYTE, gti_buf);
+                                        gl_info->gl_ops.gl.p_glFinish();
+                                        {
+                                            uint8_t *cp = gti_buf + (h/2 * w + w/2) * 4;
+                                            FILE *gf = fopen("/tmp/wined3d_getteximage.log", "w");
+                                            if (gf)
+                                            {
+                                                fprintf(gf,
+                                                    "glGetTexImage tex=%u center BGRA=[%u,%u,%u,%u]\n",
+                                                    src_name, cp[0], cp[1], cp[2], cp[3]);
+                                                fclose(gf);
+                                            }
+                                        }
+                                        free(gti_buf);
+                                    }
+                                }
+                            }
+                            gl_info->gl_ops.gl.p_glReadPixels(0, 0, w, h,
+                                    GL_BGRA, GL_UNSIGNED_BYTE, buf);
+                            checkGLcall("glReadPixels textured-quad BGRA");
+
+                            /* Cleanup shader resources. */
+                            GL_EXTCALL(glBindVertexArray(0));
+                            GL_EXTCALL(glDeleteVertexArrays(1, &vao));
+                            GL_EXTCALL(glDeleteBuffers(1, &vbo));
+                            GL_EXTCALL(glDeleteShader(vs));
+                            GL_EXTCALL(glDeleteShader(fs));
+                            GL_EXTCALL(glDeleteProgram(prog));
+                        }
+
+                        /* Cleanup FBO and texture. */
+                        GL_EXTCALL(glDeleteFramebuffers(1, &dst_fbo));
+                        gl_info->gl_ops.gl.p_glDeleteTextures(1, &dst_tex);
+
+                        /* Restore GL state so wined3d's cache stays consistent. */
+                        /* Restore sRGB decode for whichever texture we used. */
+                        {
+                            GLuint tex_restore = back_gl->texture_srgb.name
+                                    ? back_gl->texture_srgb.name
+                                    : back_gl->texture_rgb.name;
+                            gl_info->gl_ops.gl.p_glBindTexture(back_gl->target, tex_restore);
+                            gl_info->gl_ops.gl.p_glTexParameteri(back_gl->target,
+                                    GL_TEXTURE_SRGB_DECODE_EXT, GL_DECODE_EXT);
+                        }
+                        GL_EXTCALL(glUseProgram(prev_prog));
+                        GL_EXTCALL(glBindVertexArray(prev_vao));
+                        GL_EXTCALL(glActiveTexture(GL_TEXTURE0));
+                        gl_info->gl_ops.gl.p_glBindTexture(GL_TEXTURE_2D, prev_tex0);
+                        GL_EXTCALL(glActiveTexture(prev_active_tex));
+                        GL_EXTCALL(glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prev_draw_fbo));
+                        GL_EXTCALL(glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read_fbo));
+                        gl_info->gl_ops.gl.p_glViewport(prev_vp[0], prev_vp[1],
+                                prev_vp[2], prev_vp[3]);
+                        if (prev_depth) gl_info->gl_ops.gl.p_glEnable(GL_DEPTH_TEST);
+                        else            gl_info->gl_ops.gl.p_glDisable(GL_DEPTH_TEST);
+                        if (prev_blend) gl_info->gl_ops.gl.p_glEnable(GL_BLEND);
+                        else            gl_info->gl_ops.gl.p_glDisable(GL_BLEND);
+                        if (prev_cull)  gl_info->gl_ops.gl.p_glEnable(GL_CULL_FACE);
+                        else            gl_info->gl_ops.gl.p_glDisable(GL_CULL_FACE);
+                        if (prev_srgb)  gl_info->gl_ops.gl.p_glEnable(GL_FRAMEBUFFER_SRGB);
+                        else            gl_info->gl_ops.gl.p_glDisable(GL_FRAMEBUFFER_SRGB);
+                    }
+
+                    /* glGetTexImage returns rows top-down for GL textures (origin is
+                     * top-left for D3D convention), but wined3d stores textures
+                     * bottom-up internally, so flip to match SYSMEM layout. */
+                    {
+                        uint8_t *tmp = malloc(row_pitch);
+                        if (tmp)
+                        {
+                            uint8_t *top = buf;
+                            uint8_t *bot = buf + (h - 1) * row_pitch;
+                            unsigned int r;
+                            for (r = 0; r < h / 2; ++r, top += row_pitch, bot -= row_pitch)
+                            {
+                                memcpy(tmp, top, row_pitch);
+                                memcpy(top, bot, row_pitch);
+                                memcpy(bot, tmp, row_pitch);
+                            }
+                            free(tmp);
+                        }
+                    }
+
+                    wined3d_texture_validate_location(front, 0, WINED3D_LOCATION_SYSMEM);
+
+                    /* DEBUG: dump once to BMP to verify capture is non-black. */
+                    {
+                        static int dumped = 0;
+                        if (!dumped)
+                        {
+                            dumped = 1;
+                            FILE *bmp = fopen("/tmp/wined3d_snap.bmp", "wb");
+                            if (bmp)
+                            {
+                                uint32_t file_size = 54 + h * row_pitch;
+                                uint8_t hdr[54] = {0};
+                                hdr[0]='B'; hdr[1]='M';
+                                memcpy(hdr+2, &file_size, 4);
+                                hdr[10]=54;
+                                hdr[14]=40;
+                                memcpy(hdr+18, &w, 4);
+                                int neg_h = -(int)h;
+                                memcpy(hdr+22, &neg_h, 4);
+                                hdr[26]=1; hdr[28]=32;
+                                memcpy(hdr+34, &slice_pitch, 4);
+                                fwrite(hdr, 1, 54, bmp);
+                                fwrite(buf, 1, h * row_pitch, bmp);
+                                fclose(bmp);
+                                ERR("DEBUG: glGetTexImage snapshot → /tmp/wined3d_snap.bmp (%ux%u tex=%u)\n",
+                                        w, h, back_gl->texture_rgb.name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         swapchain_blit(swapchain, context, src_rect, dst_rect);
 
         if (swapchain->device->context_count > 1)
@@ -625,6 +1011,46 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
 
         /* call wglSwapBuffers through the gl table to avoid confusing the Steam overlay */
         gl_info->gl_ops.wgl.p_wglSwapBuffers(context_gl->dc);
+
+        /* CG capture: use winemac.drv PE export to reach the Core Graphics capture path.
+         * Writes directly into the front buffer's SYSMEM so GetFrontBufferData can
+         * serve it without any GPU readback (which returns black on Metal). */
+        cg_captured = FALSE;
+        {
+            typedef void (WINAPI *CAPTURE_FN)(HWND hwnd, void *buf,
+                    unsigned int w, unsigned int h, unsigned int row_pitch);
+            static CAPTURE_FN cg_capture = (CAPTURE_FN)(intptr_t)-1;
+            struct wined3d_texture *front = swapchain->front_buffer;
+
+            if (cg_capture == (CAPTURE_FN)(intptr_t)-1)
+            {
+                HMODULE mac_drv = GetModuleHandleA("winemac.drv");
+                cg_capture = mac_drv
+                        ? (CAPTURE_FN)GetProcAddress(mac_drv, "WineMacCaptureWindowPixelsBGRA")
+                        : NULL;
+                { FILE *dbg = fopen("/tmp/cg_diag.log", "w");
+                  if (dbg) { fprintf(dbg, "mac_drv=%p fn=%p\n", mac_drv, cg_capture); fclose(dbg); } }
+            }
+            if (cg_capture)
+            {
+                BOOL prep = wined3d_texture_prepare_location(front, 0, context, WINED3D_LOCATION_SYSMEM);
+                struct wined3d_bo_address snap;
+                wined3d_texture_get_bo_address(front, 0, &snap, WINED3D_LOCATION_SYSMEM);
+                { static int once = 1; if (once) { once = 0;
+                  FILE *dbg = fopen("/tmp/cg_diag.log", "a");
+                  if (dbg) { fprintf(dbg, "prep=%d bo=%p addr=%p\n", prep, (void*)snap.buffer_object, snap.addr); fclose(dbg); } } }
+                if (prep && !snap.buffer_object && snap.addr)
+                {
+                    HWND hwnd = context_gl->window;
+                    unsigned int w = wined3d_texture_get_level_width(front, 0);
+                    unsigned int h = wined3d_texture_get_level_height(front, 0);
+                    unsigned int row_pitch, slice_pitch;
+                    wined3d_texture_get_pitch(front, 0, &row_pitch, &slice_pitch);
+                    cg_capture(hwnd, snap.addr, w, h, row_pitch);
+                    cg_captured = TRUE;
+                }
+            }
+        }
     }
 
     if (context->d3d_info->fences)
@@ -634,8 +1060,10 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
 
     TRACE("SwapBuffers called, Starting new frame\n");
 
-    wined3d_texture_validate_location(swapchain->front_buffer, 0, WINED3D_LOCATION_DRAWABLE);
-    wined3d_texture_invalidate_location(swapchain->front_buffer, 0, ~WINED3D_LOCATION_DRAWABLE);
+    wined3d_texture_validate_location(swapchain->front_buffer, 0,
+            WINED3D_LOCATION_DRAWABLE | WINED3D_LOCATION_SYSMEM);
+    wined3d_texture_invalidate_location(swapchain->front_buffer, 0,
+            ~(WINED3D_LOCATION_DRAWABLE | WINED3D_LOCATION_SYSMEM));
 
     context_release(context);
 }
@@ -1336,6 +1764,11 @@ static void swapchain_gdi_present(struct wined3d_swapchain *swapchain,
     back->dc = dc;
     back->bitmap = bitmap;
     swapchain->back_buffers[0]->resource.heap_memory = data;
+
+    /* heap_memory now points to the rendered back buffer data.  Mark the
+     * front buffer SYSMEM location valid so that GetFrontBufferData can
+     * read it directly without the blt system re-filling it with black. */
+    wined3d_texture_validate_location(swapchain->front_buffer, 0, WINED3D_LOCATION_SYSMEM);
 
     SetRect(&swapchain->front_buffer_update, 0, 0,
             swapchain->front_buffer->resource.width,

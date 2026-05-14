@@ -607,10 +607,13 @@ static NTSTATUS macdrv_quit_result(void *arg)
 }
 
 
+extern NTSTATUS macdrv_capture_window_pixels(void *arg);
+
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
     macdrv_init,
     macdrv_quit_result,
+    macdrv_capture_window_pixels,
 };
 
 C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
@@ -637,6 +640,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
 {
     wow64_init,
     macdrv_quit_result,
+    macdrv_capture_window_pixels,
 };
 
 C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count );

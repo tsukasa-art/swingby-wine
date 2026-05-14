@@ -41,6 +41,16 @@
 #include <OpenGL/glu.h>
 #include <OpenGL/CGLRenderers.h>
 #include <dlfcn.h>
+#include <math.h>
+#include <unistd.h>
+/* Include only headers that are still fully available on macOS 15+.
+ * CGWindow.h is intentionally excluded; CGWindowList* are accessed via dlsym. */
+#include <CoreFoundation/CoreFoundation.h>
+#include <CoreGraphics/CGBase.h>
+#include <CoreGraphics/CGGeometry.h>
+#include <CoreGraphics/CGImage.h>
+#include <CoreGraphics/CGDataProvider.h>
+#include <dispatch/dispatch.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(wgl);
 
@@ -4388,11 +4398,278 @@ static int macdrv_wglGetPixelFormat(HDC hdc)
 }
 
 /***********************************************************************
+ *              wine_capture_window_pixels_bgra
+ *
+ * Custom capture extension exposed via wglGetProcAddress.
+ * Captures the current process's largest on-screen window using Core
+ * Graphics and writes BGRA pixels (top-down) into buf.
+ * Declared with ms_abi so it can be called from the PE-side wined3d DLL.
+ *
+ * CGWindowListCreateImage and CGWindowListCopyWindowInfo are accessed via
+ * dlsym to avoid SDK "unavailable" errors on macOS 15+.
+ */
+void wine_capture_window_pixels_bgra(
+        HWND hwnd, void *buf, unsigned int w, unsigned int h, unsigned int row_pitch)
+{
+    typedef bool (*pfn_preflight)(void);
+    typedef CFArrayRef (*pfn_CGWindowListCopyWindowInfo)(uint32_t options, uint32_t relative);
+    typedef CGImageRef (*pfn_CGWindowListCreateImage)(CGRect bounds, uint32_t listOpts,
+                                                      uint32_t windowID, uint32_t imageOpts);
+    typedef CGImageRef (*pfn_CGWindowListCreateImageFromArray)(CGRect bounds, CFArrayRef windowArray,
+                                                               uint32_t imageOpts);
+
+    static pfn_preflight               fn_preflight   = (pfn_preflight)(intptr_t)-1;
+    static pfn_CGWindowListCopyWindowInfo fn_copyInfo = (pfn_CGWindowListCopyWindowInfo)(intptr_t)-1;
+    static pfn_CGWindowListCreateImage    fn_createImage = (pfn_CGWindowListCreateImage)(intptr_t)-1;
+    static pfn_CGWindowListCreateImageFromArray fn_createImageFromArray = (pfn_CGWindowListCreateImageFromArray)(intptr_t)-1;
+    static CFStringRef key_OwnerPID = NULL;
+    static CFStringRef key_Number   = NULL;
+    static CFStringRef key_Bounds   = NULL;
+
+    pid_t pid = getpid();
+    uint32_t win_id = 0;
+    FILE *dbg = NULL;
+
+    if (!buf || !w || !h) return;
+
+    /* Try Wukiyo snapshot file first (ScreenCaptureKit, accurate Metal content). */
+    {
+        int ok = 0;
+        FILE *f = fopen("/tmp/wukiyo_snap.bgra", "rb");
+        if (f)
+        {
+            uint32_t fw = 0, fh = 0, fstride = 0;
+            if (fread(&fw, 4, 1, f) == 1 && fread(&fh, 4, 1, f) == 1 &&
+                fread(&fstride, 4, 1, f) == 1 && fw > 0 && fh > 0 && fstride >= fw * 4)
+            {
+                size_t pix_size = (size_t)fstride * fh;
+                uint8_t *pixels = (uint8_t *)malloc(pix_size);
+                if (pixels)
+                {
+                    if (fread(pixels, 1, pix_size, f) == pix_size)
+                    {
+                        /* Nearest-neighbor scale from (fw × fh) → (w × h). */
+                        unsigned int dy, dx;
+                        for (dy = 0; dy < h; dy++)
+                        {
+                            uint32_t sy = (uint32_t)((uint64_t)dy * fh / h);
+                            const uint8_t *src_row = pixels + (size_t)sy * fstride;
+                            uint8_t *dst_row = (uint8_t *)buf + (size_t)dy * row_pitch;
+                            for (dx = 0; dx < w; dx++)
+                            {
+                                uint32_t sx = (uint32_t)((uint64_t)dx * fw / w);
+                                memcpy(dst_row + dx * 4, src_row + sx * 4, 4);
+                                dst_row[dx * 4 + 3] = 0xffu;
+                            }
+                        }
+                        ok = 1;
+                    }
+                    free(pixels);
+                }
+            }
+            fclose(f);
+        }
+        if (ok) return;
+    }
+
+    /* One-time dlsym lookup. */
+    if (fn_preflight == (pfn_preflight)(intptr_t)-1)
+    {
+        typedef bool (*pfn_request)(void);
+        pfn_request fn_request;
+        void **p;
+        fn_preflight   = (pfn_preflight)dlsym(RTLD_DEFAULT, "CGPreflightScreenCaptureAccess");
+        fn_copyInfo    = (pfn_CGWindowListCopyWindowInfo)dlsym(RTLD_DEFAULT, "CGWindowListCopyWindowInfo");
+        fn_createImage = (pfn_CGWindowListCreateImage)dlsym(RTLD_DEFAULT, "CGWindowListCreateImage");
+        fn_createImageFromArray = (pfn_CGWindowListCreateImageFromArray)dlsym(RTLD_DEFAULT, "CGWindowListCreateImageFromArray");
+        p = dlsym(RTLD_DEFAULT, "kCGWindowOwnerPID"); if (p) key_OwnerPID = (CFStringRef)*p;
+        p = dlsym(RTLD_DEFAULT, "kCGWindowNumber");   if (p) key_Number   = (CFStringRef)*p;
+        p = dlsym(RTLD_DEFAULT, "kCGWindowBounds");   if (p) key_Bounds   = (CFStringRef)*p;
+        /* Trigger the system permission dialog on first load if not already granted.
+         * CGRequestScreenCaptureAccess is safe to call from any thread on macOS 10.15+. */
+        if (fn_preflight && !fn_preflight())
+        {
+            fn_request = (pfn_request)dlsym(RTLD_DEFAULT, "CGRequestScreenCaptureAccess");
+            if (fn_request) fn_request();
+        }
+    }
+
+    if (!fn_copyInfo || !fn_createImage || !key_OwnerPID || !key_Number || !key_Bounds) return;
+
+    /* Log permission status and proceed regardless — CGWindowListCreateImage returns
+     * NULL if screen recording is denied; that is handled below. */
+    {
+        static int first = 1;
+        if (first)
+        {
+            first = 0;
+            dbg = fopen("/tmp/wined3d_cgcap.log", "w");
+            if (dbg)
+            {
+                int perm = fn_preflight ? (int)fn_preflight() : -1;
+                fprintf(dbg, "wine_capture: hwnd=%p w=%u h=%u pitch=%u pid=%d perm=%d\n",
+                        hwnd, w, h, row_pitch, (int)pid, perm);
+            }
+        }
+    }
+
+    /* Enumerate on-screen windows; find our process's largest one.
+     * Also record its screen-coordinate bounds for the capture call. */
+    CGRect win_screen_rect = {{0,0},{0,0}};
+    {
+        /* kCGWindowListOptionOnScreenOnly=1, kCGWindowListExcludeDesktopElements=16 */
+        CFArrayRef list = fn_copyInfo(1u | 16u, 0u);
+        if (list)
+        {
+            /* Match by content size: prefer the window whose width equals the
+             * requested buffer width (w), since multiple Wine windows may share
+             * the same PID (e.g. game window + Sikarugir launcher overlay). */
+            CGFloat best_score = 1e9;
+            CFIndex i, count = CFArrayGetCount(list);
+            for (i = 0; i < count; i++)
+            {
+                int wpid = 0;
+                CFDictionaryRef info = (CFDictionaryRef)CFArrayGetValueAtIndex(list, i);
+                CFNumberRef pid_num = (CFNumberRef)CFDictionaryGetValue(info, key_OwnerPID);
+                if (!pid_num) continue;
+                CFNumberGetValue(pid_num, kCFNumberIntType, &wpid);
+                if (wpid != (int)pid) continue;
+                {
+                    CFDictionaryRef bounds = (CFDictionaryRef)CFDictionaryGetValue(info, key_Bounds);
+                    if (bounds)
+                    {
+                        double bx = 0, by = 0, bw = 0, bh = 0;
+                        CFNumberRef nx = (CFNumberRef)CFDictionaryGetValue(bounds, CFSTR("X"));
+                        CFNumberRef ny = (CFNumberRef)CFDictionaryGetValue(bounds, CFSTR("Y"));
+                        CFNumberRef nw = (CFNumberRef)CFDictionaryGetValue(bounds, CFSTR("Width"));
+                        CFNumberRef nh = (CFNumberRef)CFDictionaryGetValue(bounds, CFSTR("Height"));
+                        if (nx) CFNumberGetValue(nx, kCFNumberDoubleType, &bx);
+                        if (ny) CFNumberGetValue(ny, kCFNumberDoubleType, &by);
+                        if (nw) CFNumberGetValue(nw, kCFNumberDoubleType, &bw);
+                        if (nh) CFNumberGetValue(nh, kCFNumberDoubleType, &bh);
+                        /* Score = how close the window width is to our buffer width.
+                         * Tie-break by height difference (title bar offset is ~30pt). */
+                        CGFloat score = fabs(bw - (CGFloat)w) * 100.0 + fabs(bh - (CGFloat)(h + 30));
+                        if (score < best_score)
+                        {
+                            CFNumberRef id_num = (CFNumberRef)CFDictionaryGetValue(info, key_Number);
+                            if (id_num)
+                            {
+                                uint32_t wid = 0;
+                                CFNumberGetValue(id_num, kCFNumberSInt32Type, &wid);
+                                win_id = wid;
+                                best_score = score;
+                                win_screen_rect = CGRectMake((CGFloat)bx, (CGFloat)by,
+                                                             (CGFloat)bw, (CGFloat)bh);
+                            }
+                        }
+                    }
+                }
+            }
+            CFRelease(list);
+        }
+    }
+
+    if (dbg) fprintf(dbg, "win_id=%u rect=%.0f,%.0f,%.0f,%.0f\n", win_id,
+            win_screen_rect.origin.x, win_screen_rect.origin.y,
+            win_screen_rect.size.width, win_screen_rect.size.height);
+
+    if (win_id)
+    {
+        /* CGWindowListCreateImageFromArray with only this window's ID gives us just
+         * this window's composited contribution (Metal content included), without any
+         * windows that may be layered on top (e.g. the Sikarugir launcher). */
+        CGImageRef img = NULL;
+        if (fn_createImageFromArray)
+        {
+            uint32_t widval = win_id;
+            CFNumberRef widref = CFNumberCreate(NULL, kCFNumberSInt32Type, &widval);
+            if (widref)
+            {
+                CFArrayRef arr = CFArrayCreate(NULL, (const void **)&widref, 1, &kCFTypeArrayCallBacks);
+                if (arr)
+                {
+                    img = fn_createImageFromArray(CGRectNull, arr, 1u /* BoundsIgnoreFraming */);
+                    CFRelease(arr);
+                }
+                CFRelease(widref);
+            }
+        }
+        /* Fallback: kCGWindowListOptionOnScreenOnly captures Metal content but includes
+         * windows on top; use only when the dedicated-array method is unavailable. */
+        if (!img)
+            img = fn_createImage(win_screen_rect, 1u, win_id, 1u /* BoundsIgnoreFraming */);
+        if (dbg) fprintf(dbg, "img=%p img_w=%zu img_h=%zu\n",
+                img, img ? CGImageGetWidth(img) : 0, img ? CGImageGetHeight(img) : 0);
+        if (img)
+        {
+            /* Draw the captured image into our BGRA buffer via CGBitmapContext.
+             * CGDataProviderCopyData crashes on IOSurface-backed CGImages (screen captures);
+             * CGContextDrawImage handles any backing without raw data access. */
+            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+            if (cs)
+            {
+                /* ByteOrder32Little + PremultipliedFirst = BGRA in memory. */
+                CGContextRef ctx = CGBitmapContextCreate(
+                        buf, w, h, 8, row_pitch, cs,
+                        kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+                CGColorSpaceRelease(cs);
+                if (ctx)
+                {
+                    /* CGBitmapContext origin is bottom-left; flip to produce top-down pixels. */
+                    CGContextTranslateCTM(ctx, 0, (CGFloat)h);
+                    CGContextScaleCTM(ctx, 1.0, -1.0);
+                    CGContextDrawImage(ctx, CGRectMake(0, 0, (CGFloat)w, (CGFloat)h), img);
+                    CGContextRelease(ctx);
+
+                    /* Force alpha = 0xff; game content is always fully opaque. */
+                    {
+                        unsigned int y;
+                        for (y = 0; y < h; y++)
+                        {
+                            uint8_t *row = (uint8_t *)buf + (size_t)y * row_pitch;
+                            unsigned int x;
+                            for (x = 0; x < w; x++)
+                                row[x * 4 + 3] = 0xffu;
+                        }
+                    }
+                    if (dbg)
+                    {
+                        const uint8_t *cp = (const uint8_t *)buf
+                                + (h / 2) * (size_t)row_pitch + (w / 2) * 4;
+                        fprintf(dbg, "center=[%u,%u,%u,%u]\n", cp[0], cp[1], cp[2], cp[3]);
+                    }
+                }
+                else if (dbg) fprintf(dbg, "CGBitmapContextCreate failed\n");
+            }
+            CGImageRelease(img);
+        }
+        else if (dbg) fprintf(dbg, "CGWindowListCreateImage returned NULL\n");
+    }
+
+    if (dbg) { fprintf(dbg, "done\n"); fclose(dbg); }
+}
+
+NTSTATUS macdrv_capture_window_pixels(void *arg)
+{
+    struct capture_window_pixels_params *params = arg;
+    wine_capture_window_pixels_bgra(
+            (HWND)(UINT_PTR)params->hwnd,
+            (void *)(UINT_PTR)params->buf,
+            params->w, params->h, params->row_pitch);
+    return 0;
+}
+
+/***********************************************************************
  *              macdrv_wglGetProcAddress
  */
 static PROC macdrv_wglGetProcAddress(const char *proc)
 {
     void *ret;
+
+    /* Custom wine extension: Core Graphics window capture for save thumbnails. */
+    if (!strcmp(proc, "wineCapture_GetWindowPixelsBGRA"))
+        return (PROC)wine_capture_window_pixels_bgra;
 
     if (!strncmp(proc, "wgl", 3)) return NULL;
     ret = dlsym(opengl_handle, proc);

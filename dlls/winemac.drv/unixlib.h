@@ -23,7 +23,16 @@ enum macdrv_funcs
 {
     unix_init,
     unix_quit_result,
+    unix_capture_window_pixels,
     unix_funcs_count
+};
+
+/* macdrv_capture_window_pixels params */
+struct capture_window_pixels_params
+{
+    UINT64 hwnd;
+    UINT64 buf;
+    UINT   w, h, row_pitch;
 };
 
 #define MACDRV_CALL(func, params) WINE_UNIX_CALL(unix_ ## func, params)

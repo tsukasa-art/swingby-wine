@@ -234,6 +234,184 @@ static HRESULT WINAPI d3d9_surface_GetDesc(IDirect3DSurface9 *iface, D3DSURFACE_
     return D3D_OK;
 }
 
+/* ---------- Wukiyo per-slot thumbnail injection ----------
+ *
+ * CatSystem2 (CMVS64) calls StretchRect(backbuffer → 192×108 RT) then LockRect(0x800)
+ * once for EACH visible save slot when the save/load screen renders.  By counting
+ * StretchRect events we can determine which slot is being rendered and inject the
+ * screenshot that was taken at that slot's save time.
+ *
+ * Communication files (all written by Wukiyo on macOS side):
+ *   /tmp/wukiyo_snap.bgra          – fallback: most recent screenshot (persistent)
+ *   /tmp/wukiyo_snap_NNN.bgra      – per-slot snap for slot NNN (written at save time)
+ *   /tmp/wukiyo_page_base.txt      – first slot number of the current save-screen page
+ */
+
+static void wukiyo_free_pix_cache(void); /* forward declaration */
+
+/* Simple pixel cache shared across all inject calls for a given snap file. */
+static struct {
+    char         path[64];
+    BYTE        *pixels;
+    unsigned int fw, fh, fstride;
+} s_pix_cache;
+
+/* Registry: maps 192x108 surface ifaces → 0-indexed file slot numbers. */
+#define WUKIYO_MAX_SLOTS 18
+static struct { IDirect3DSurface9 *iface; unsigned int slot; } s_reg[WUKIYO_MAX_SLOTS];
+static unsigned int s_reg_count     = 0;
+static unsigned int s_reg_page_base = (unsigned int)-1; /* sentinel: unset */
+static DWORD        s_reg_last_tick = 0;
+
+static unsigned int wukiyo_registry_slot(IDirect3DSurface9 *iface)
+{
+    DWORD now = GetTickCount();
+    unsigned int i, page_base;
+    FILE *f;
+
+    /* Flush if idle > 1 s (page changed or save screen reopened). */
+    if (s_reg_count > 0 && (DWORD)(now - s_reg_last_tick) > 1000) {
+        s_reg_count = 0;
+        s_reg_page_base = (unsigned int)-1;
+        wukiyo_free_pix_cache();
+    }
+    s_reg_last_tick = now;
+
+    if (s_reg_page_base == (unsigned int)-1) {
+        page_base = 0;
+        f = fopen("Z:\\tmp\\wukiyo_page_base.txt", "rb");
+        if (f) { fscanf(f, "%u", &page_base); fclose(f); }
+        s_reg_page_base = page_base;
+    }
+
+    for (i = 0; i < s_reg_count; i++)
+        if (s_reg[i].iface == iface) return s_reg[i].slot;
+
+    if (s_reg_count < WUKIYO_MAX_SLOTS) {
+        unsigned int slot = s_reg_page_base + s_reg_count;
+        s_reg[s_reg_count].iface = iface;
+        s_reg[s_reg_count].slot  = slot;
+        s_reg_count++;
+        return slot;
+    }
+    return (unsigned int)-1;
+}
+
+static void wukiyo_free_pix_cache(void)
+{
+    if (s_pix_cache.pixels) {
+        HeapFree(GetProcessHeap(), 0, s_pix_cache.pixels);
+        s_pix_cache.pixels = NULL;
+        s_pix_cache.path[0] = '\0';
+    }
+}
+
+/* Load pixels from a snap file.  Returns FALSE on failure.
+ * Caches the last loaded file to avoid redundant reads for the same slot. */
+static BOOL wukiyo_load_snap_file(const char *path,
+    BYTE **out_px, unsigned int *out_fw, unsigned int *out_fh, unsigned int *out_fstride)
+{
+    unsigned int fw = 0, fh = 0, fstride = 0;
+    SIZE_T pix_size;
+    BYTE *px;
+    FILE *f;
+
+    /* Return cached pixels if path unchanged. */
+    if (s_pix_cache.pixels && strcmp(s_pix_cache.path, path) == 0) {
+        *out_px = s_pix_cache.pixels; *out_fw = s_pix_cache.fw;
+        *out_fh = s_pix_cache.fh;    *out_fstride = s_pix_cache.fstride;
+        return TRUE;
+    }
+
+    f = fopen(path, "rb");
+    if (!f) return FALSE;
+    if (fread(&fw, 4, 1, f) != 1 || fread(&fh, 4, 1, f) != 1 ||
+        fread(&fstride, 4, 1, f) != 1 || fw <= 1 || fh <= 1 || fstride < fw * 4)
+    { fclose(f); return FALSE; }
+    pix_size = (SIZE_T)fstride * fh;
+    px = HeapAlloc(GetProcessHeap(), 0, pix_size);
+    if (!px || fread(px, 1, pix_size, f) != pix_size)
+    { HeapFree(GetProcessHeap(), 0, px); fclose(f); return FALSE; }
+    fclose(f);
+
+    wukiyo_free_pix_cache();
+    s_pix_cache.pixels  = px;
+    s_pix_cache.fw      = fw;
+    s_pix_cache.fh      = fh;
+    s_pix_cache.fstride = fstride;
+    { size_t n = strlen(path); if (n >= sizeof(s_pix_cache.path)) n = sizeof(s_pix_cache.path)-1;
+      memcpy(s_pix_cache.path, path, n); s_pix_cache.path[n] = '\0'; }
+
+    *out_px = px; *out_fw = fw; *out_fh = fh; *out_fstride = fstride;
+    return TRUE;
+}
+
+/* Blit pixels (top-down) into the locked surface buffer (bottom-up readback). */
+static void wukiyo_blit(void *dst_data, unsigned int dst_pitch,
+    const BYTE *src_px, unsigned int src_fw, unsigned int src_fh, unsigned int src_fstride)
+{
+    unsigned int dy, dx;
+    for (dy = 0; dy < 108; dy++)
+    {
+        unsigned int sy = (unsigned int)((UINT64)dy * src_fh / 108);
+        const BYTE *src = src_px + (SIZE_T)sy * src_fstride;
+        BYTE       *dst = (BYTE *)dst_data + (SIZE_T)dy * dst_pitch;
+        for (dx = 0; dx < 192; dx++)
+        {
+            unsigned int sx = (unsigned int)((UINT64)dx * src_fw / 192);
+            dst[dx*4+0] = src[sx*4+0];
+            dst[dx*4+1] = src[sx*4+1];
+            dst[dx*4+2] = src[sx*4+2];
+            dst[dx*4+3] = 0xFF;
+        }
+    }
+}
+
+/* Surface pointer set by StretchRect; cleared after one-shot injection. */
+static IDirect3DSurface9 *s_inject_pending_surf = NULL;
+static DWORD               s_inject_pending_tick = 0;
+
+/* Called from device.c on every StretchRect to a 192x108 destination. */
+void wukiyo_on_stretchrect(IDirect3DSurface9 *dest)
+{
+    s_inject_pending_surf = dest;
+    s_inject_pending_tick = GetTickCount();
+    { FILE *lg = fopen("Z:\\tmp\\wukiyo_trace.txt","a");
+      if (lg) { fprintf(lg,"stretchrect dest=%p\n",(void*)dest); fclose(lg); } }
+}
+
+/* Called from device.c when GetRenderTargetData is called for a 192x108 dst surface. */
+void wukiyo_on_get_render_target_data(IDirect3DSurface9 *src, IDirect3DSurface9 *dst)
+{
+    s_inject_pending_surf = dst;
+    s_inject_pending_tick = GetTickCount();
+    { FILE *lg = fopen("Z:\\tmp\\wukiyo_trace.txt","a");
+      if (lg) { fprintf(lg,"getrtdata_set pending=dst=%p\n",(void*)dst); fclose(lg); } }
+}
+
+/* Inject the per-slot snap (wukiyo_snap_NNN.bgra) into the locked surface buffer. */
+static void wukiyo_inject_snap_slot(void *data, unsigned int row_pitch, int slot)
+{
+    char         path[64];
+    BYTE        *px = NULL;
+    unsigned int fw, fh, fstride;
+    snprintf(path, sizeof(path), "Z:\\tmp\\wukiyo_snap_%03d.bgra", slot);
+    if (wukiyo_load_snap_file(path, &px, &fw, &fh, &fstride))
+        wukiyo_blit(data, row_pitch, px, fw, fh, fstride);
+}
+
+/* State for counter-based 192x108 thumbnail injection. */
+static DWORD              s_192_last_tick    = 0;
+static int                s_192_counter      = 0;
+static int                s_inject_at        = -1;
+static int                s_inject_slot      = -1;
+static LONGLONG           s_slot_file_time   = 0;
+/* Pending UnlockRect injection: write snap AFTER game fills the surface. */
+static IDirect3DSurface9 *s_unlock_iface     = NULL;
+static void              *s_unlock_data      = NULL;
+static unsigned int       s_unlock_pitch     = 0;
+static int                s_unlock_slot      = -1;
+
 static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
         D3DLOCKED_RECT *locked_rect, const RECT *rect, DWORD flags)
 {
@@ -244,7 +422,6 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
 
     TRACE("iface %p, locked_rect %p, rect %s, flags %#lx.\n",
             iface, locked_rect, wine_dbgstr_rect(rect), flags);
-
     if (rect)
         wined3d_box_set(&box, rect->left, rect->top, rect->right, rect->bottom, 0, 1);
 
@@ -255,6 +432,65 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
     {
         locked_rect->Pitch = map_desc.row_pitch;
         locked_rect->pBits = map_desc.data;
+
+        /* Counter-based injection: fire when the N-th 192x108 LockRect of a sequence matches. */
+        if (map_desc.data)
+        {
+            struct wined3d_sub_resource_desc _d;
+            wined3d_texture_get_sub_resource_desc(surface->wined3d_texture,
+                surface->sub_resource_idx, &_d);
+            if (_d.width == 192 && _d.height == 108)
+            {
+                DWORD now = GetTickCount();
+                BOOL  new_seq = (s_192_last_tick == 0 || (DWORD)(now - s_192_last_tick) > 2000);
+                s_192_last_tick = now;
+
+                /* Check if inject_slot.txt was written/updated since last read (mtime-based). */
+                {
+                    WIN32_FILE_ATTRIBUTE_DATA fa;
+                    if (GetFileAttributesExA("Z:\\tmp\\wukiyo_inject_slot.txt",
+                                             GetFileExInfoStandard, &fa))
+                    {
+                        LONGLONG ft = ((LONGLONG)fa.ftLastWriteTime.dwHighDateTime << 32)
+                                    | fa.ftLastWriteTime.dwLowDateTime;
+                        if (ft != s_slot_file_time)
+                        {
+                            /* New save detected: read target and reset counter. */
+                            FILE *sf = fopen("Z:\\tmp\\wukiyo_inject_slot.txt", "r");
+                            if (sf)
+                            {
+                                int slot, pb;
+                                if (fscanf(sf, "%d %d", &slot, &pb) == 2)
+                                {
+                                    s_inject_at      = slot - pb;
+                                    s_inject_slot    = slot;
+                                    s_slot_file_time = ft;
+                                    s_192_counter    = 0;
+                                    new_seq          = FALSE; /* counter already reset */
+                                }
+                                fclose(sf);
+                            }
+                        }
+                    }
+                }
+
+                if (new_seq)
+                    s_192_counter = 0;
+
+                if (s_inject_at >= 0 && s_192_counter == s_inject_at)
+                {
+                    /* Defer: store pointer so UnlockRect can inject AFTER game writes. */
+                    s_unlock_iface = iface;
+                    s_unlock_data  = map_desc.data;
+                    s_unlock_pitch = map_desc.row_pitch;
+                    s_unlock_slot  = s_inject_slot;
+                    s_inject_at      = -1;
+                    s_slot_file_time = 0;
+                    DeleteFileA("Z:\\tmp\\wukiyo_inject_slot.txt");
+                }
+                s_192_counter++;
+            }
+        }
     }
 
     if (hr == E_INVALIDARG)
@@ -268,6 +504,16 @@ static HRESULT WINAPI d3d9_surface_UnlockRect(IDirect3DSurface9 *iface)
     HRESULT hr;
 
     TRACE("iface %p.\n", iface);
+
+    /* Inject snap AFTER game has written its thumbnail data, before unmap. */
+    if (iface == s_unlock_iface && s_unlock_data != NULL)
+    {
+        wukiyo_inject_snap_slot(s_unlock_data, s_unlock_pitch, s_unlock_slot);
+        { FILE *lg = fopen("Z:\\tmp\\wukiyo_inject_fired.txt","w");
+          if (lg) { fprintf(lg,"injected slot=%d\n", s_unlock_slot); fclose(lg); } }
+        s_unlock_iface = NULL;
+        s_unlock_data  = NULL;
+    }
 
     wined3d_mutex_lock();
     hr = wined3d_resource_unmap(wined3d_texture_get_resource(surface->wined3d_texture), surface->sub_resource_idx);

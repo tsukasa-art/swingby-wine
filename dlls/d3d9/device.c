@@ -1248,6 +1248,8 @@ static HRESULT WINAPI DECLSPEC_HOTPATCH d3d9_device_Reset(IDirect3DDevice9Ex *if
     return d3d9_device_reset(device, present_parameters, NULL);
 }
 
+static void wukiyo_capture_frontbuffer(IDirect3DDevice9Ex *iface, struct d3d9_device *device);
+
 static HRESULT WINAPI DECLSPEC_HOTPATCH d3d9_device_Present(IDirect3DDevice9Ex *iface,
         const RECT *src_rect, const RECT *dst_rect, HWND dst_window_override, const RGNDATA *dirty_region)
 {
@@ -1278,6 +1280,7 @@ static HRESULT WINAPI DECLSPEC_HOTPATCH d3d9_device_Present(IDirect3DDevice9Ex *
     }
     wined3d_mutex_unlock();
 
+    wukiyo_capture_frontbuffer(iface, device);
     return D3D_OK;
 }
 
@@ -1865,6 +1868,7 @@ static HRESULT WINAPI d3d9_device_GetRenderTargetData(IDirect3DDevice9Ex *iface,
     struct wined3d_sub_resource_desc wined3d_desc;
     RECT dst_rect, src_rect;
     HRESULT hr;
+    BOOL dst_is_192x108;
 
     TRACE("iface %p, render_target %p, dst_surface %p.\n", iface, render_target, dst_surface);
 
@@ -1872,6 +1876,35 @@ static HRESULT WINAPI d3d9_device_GetRenderTargetData(IDirect3DDevice9Ex *iface,
         return D3DERR_INVALIDCALL;
 
     wined3d_mutex_lock();
+
+    /* Wukiyo: check thumbnail size before any early return. */
+    wined3d_texture_get_sub_resource_desc(dst_impl->wined3d_texture, dst_impl->sub_resource_idx, &wined3d_desc);
+    dst_is_192x108 = (wined3d_desc.width == 192 && wined3d_desc.height == 108);
+    { struct wined3d_sub_resource_desc _src_desc;
+      wined3d_texture_get_sub_resource_desc(rt_impl->wined3d_texture, rt_impl->sub_resource_idx, &_src_desc);
+      if (wined3d_desc.width < 1024 || _src_desc.width < 1024) {
+        FILE *lg = fopen("Z:\\tmp\\wukiyo_trace.txt","a");
+        if (lg) { fprintf(lg,"getrtdata src=%ux%u dst=%ux%u\n",
+            _src_desc.width,_src_desc.height,wined3d_desc.width,wined3d_desc.height); fclose(lg); }
+      }
+    }
+
+    /* On Metal-backed GL, GL readback from render targets returns black.
+     * Try to satisfy the request from the CG-captured front buffer SYSMEM instead. */
+    if (device->implicit_swapchain_count > 0)
+    {
+        hr = wined3d_swapchain_get_front_buffer_data(device->implicit_swapchains[0],
+                dst_impl->wined3d_texture, dst_impl->sub_resource_idx);
+        if (SUCCEEDED(hr))
+        {
+            wined3d_mutex_unlock();
+            if (dst_is_192x108)
+            { extern void wukiyo_on_get_render_target_data(IDirect3DSurface9 *s, IDirect3DSurface9 *d);
+              wukiyo_on_get_render_target_data(render_target, dst_surface); }
+            return hr;
+        }
+    }
+
     wined3d_texture_get_sub_resource_desc(dst_impl->wined3d_texture, dst_impl->sub_resource_idx, &wined3d_desc);
     SetRect(&dst_rect, 0, 0, wined3d_desc.width, wined3d_desc.height);
 
@@ -1886,7 +1919,11 @@ static HRESULT WINAPI d3d9_device_GetRenderTargetData(IDirect3DDevice9Ex *iface,
                 dst_impl->wined3d_texture, dst_impl->sub_resource_idx, &dst_rect,
                 rt_impl->wined3d_texture, rt_impl->sub_resource_idx, &src_rect, 0, NULL, WINED3D_TEXF_POINT);
     wined3d_mutex_unlock();
-
+    if (SUCCEEDED(hr) && dst_is_192x108)
+    {
+        extern void wukiyo_on_get_render_target_data(IDirect3DSurface9 *s, IDirect3DSurface9 *d);
+        wukiyo_on_get_render_target_data(render_target, dst_surface);
+    }
     return hr;
 }
 
@@ -1898,6 +1935,7 @@ static HRESULT WINAPI d3d9_device_GetFrontBufferData(IDirect3DDevice9Ex *iface,
     HRESULT hr = D3DERR_INVALIDCALL;
 
     TRACE("iface %p, swapchain %u, dst_surface %p.\n", iface, swapchain, dst_surface);
+    { FILE *f = fopen("/tmp/d3d9_cap.log","a"); if(f){fprintf(f,"GetFrontBufferData sw=%u dst=%p\n",swapchain,dst_surface);fclose(f);} }
 
     wined3d_mutex_lock();
     if (swapchain < device->implicit_swapchain_count)
@@ -1991,6 +2029,13 @@ static HRESULT WINAPI d3d9_device_StretchRect(IDirect3DDevice9Ex *iface, IDirect
         hr = D3DERR_INVALIDCALL;
     if (SUCCEEDED(hr) && dst->texture)
         d3d9_texture_flag_auto_gen_mipmap(dst->texture);
+
+    /* Wukiyo: notify surface.c of StretchRect to 192x108 (stub; kept for ABI). */
+    if (SUCCEEDED(hr) && dst_desc.width == 192 && dst_desc.height == 108)
+    {
+        extern void wukiyo_on_stretchrect(IDirect3DSurface9 *dest);
+        wukiyo_on_stretchrect(dst_surface);
+    }
 
 done:
     wined3d_mutex_unlock();
@@ -2107,6 +2152,58 @@ static HRESULT WINAPI d3d9_device_CreateOffscreenPlainSurface(IDirect3DDevice9Ex
 
     return d3d9_device_create_surface(device, 0, wined3dformat_from_d3dformat(format),
             WINED3D_MULTISAMPLE_NONE, 0, usage, 0, access, width, height, user_mem, surface);
+}
+
+/* Capture the front buffer to /tmp/wukiyo_snap.bgra when trigger file exists.
+ * Uses GetFrontBufferData which internally uses CG capture on Metal — bypasses compositor
+ * visibility issues that plague screencapture -R/-l for Wine Metal windows. */
+static void wukiyo_capture_frontbuffer(IDirect3DDevice9Ex *iface, struct d3d9_device *device)
+{
+    static const char snap_trigger[] = "Z:\\tmp\\wukiyo_take_snap";
+    static const char snap_out[]     = "Z:\\tmp\\wukiyo_snap.bgra";
+    static const char snap_ready[]   = "Z:\\tmp\\wukiyo_snap_ready";
+    IDirect3DSurface9 *bb = NULL, *sys = NULL;
+    D3DSURFACE_DESC desc;
+    D3DLOCKED_RECT lr;
+    FILE *f;
+    UINT row;
+
+    { FILE *t = fopen(snap_trigger, "rb"); if (!t) return; fclose(t); }
+    remove(snap_trigger);
+    { FILE *lg = fopen("Z:\\tmp\\wukiyo_cap_dbg.txt", "a");
+      if (lg) { fprintf(lg, "capture triggered sc_count=%u\n", device->implicit_swapchain_count); fclose(lg); } }
+
+    if (!device->implicit_swapchain_count) return;
+
+    if (FAILED(d3d9_device_GetBackBuffer(iface, 0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) return;
+    IDirect3DSurface9_GetDesc(bb, &desc);
+    IDirect3DSurface9_Release(bb);
+
+    if (FAILED(d3d9_device_CreateOffscreenPlainSurface(iface, desc.Width, desc.Height,
+            D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &sys, NULL))) return;
+
+    { HRESULT gfb_hr = d3d9_device_GetFrontBufferData(iface, 0, sys);
+      { FILE *lg = fopen("Z:\\tmp\\wukiyo_cap_dbg.txt", "a");
+        if (lg) { fprintf(lg, "GetFrontBufferData hr=%08lx w=%u h=%u\n", gfb_hr, desc.Width, desc.Height); fclose(lg); } }
+      if (FAILED(gfb_hr)) { IDirect3DSurface9_Release(sys); return; } }
+
+    if (SUCCEEDED(IDirect3DSurface9_LockRect(sys, &lr, NULL, 0)))
+    {
+        f = fopen(snap_out, "wb");
+        if (f)
+        {
+            uint32_t w = desc.Width, h = desc.Height, s = (uint32_t)lr.Pitch;
+            fwrite(&w, 4, 1, f);
+            fwrite(&h, 4, 1, f);
+            fwrite(&s, 4, 1, f);
+            for (row = 0; row < desc.Height; row++)
+                fwrite((char *)lr.pBits + (size_t)row * lr.Pitch, desc.Width * 4, 1, f);
+            fclose(f);
+            f = fopen(snap_ready, "wb"); if (f) fclose(f);
+        }
+        IDirect3DSurface9_UnlockRect(sys);
+    }
+    IDirect3DSurface9_Release(sys);
 }
 
 static HRESULT WINAPI d3d9_device_SetRenderTarget(IDirect3DDevice9Ex *iface, DWORD idx, IDirect3DSurface9 *surface)
@@ -4201,6 +4298,7 @@ static HRESULT WINAPI DECLSPEC_HOTPATCH d3d9_device_PresentEx(IDirect3DDevice9Ex
     }
     wined3d_mutex_unlock();
 
+    wukiyo_capture_frontbuffer(iface, device);
     return D3D_OK;
 }
 
