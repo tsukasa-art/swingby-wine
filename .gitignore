@@ -3,6 +3,7 @@ build-arm64/
 .cache/
 config.log
 .DS_Store
+.claude_state.md
 *.o
 *.so
 *.dylib
