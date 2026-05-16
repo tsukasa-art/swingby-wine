@@ -1,0 +1,8 @@
+build/
+build-arm64/
+.cache/
+config.log
+.DS_Store
+*.o
+*.so
+*.dylib

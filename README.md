@@ -1,3 +1,55 @@
+# wine-wukiyo
+
+Wine fork for running Japanese visual novels on macOS (Apple Silicon / Rosetta 2), built for use with the [Wukiyo](https://github.com/tsukasa-art/Wukiyo) launcher.
+
+Based on **Wine 10.0**.
+
+## Patches
+
+### `winemac.drv` — Metal window capture (`macdrv_GetImage`)
+
+Adds `macdrv_GetImage` to `winemac.drv` so that `GetDIBits`/`BitBlt` can read back pixels from Metal-rendered windows. Without this, GDI-based screen capture returns black because Wine's GDI layer and macOS Metal are fully separated rendering stacks.
+
+**Affected files**: `dlls/winemac.drv/`
+
+### `d3d9` — Save-screen thumbnail injection (`wukiyo-thumbnail-injection` branch)
+
+Hooks into the D3D9 `LockRect` / `UnlockRect` cycle of save-screen surfaces (192×108) to inject per-slot screenshots captured by Wukiyo.
+
+How it works:
+
+1. Wukiyo captures the game window via ScreenCaptureKit and writes `~/.wukiyo_snaps/wukiyo_snap_NNN.bgra` at save time.
+2. `surface.c` detects 192×108 `LockRect` calls, reads `page_base.txt` to compute the target slot, and blits the BGRA snap over the game's write after `UnlockRect`.
+
+Snap file format: `[u32 width][u32 height][u32 stride] + BGRA pixels (top-down)`.
+
+**Affected files**: `dlls/d3d9/surface.c`, `dlls/d3d9/device.c`
+
+## Branches
+
+| Branch | Description |
+|---|---|
+| `master` | Wine 10.0 + `macdrv_GetImage` patch |
+| `wukiyo-thumbnail-injection` | `master` + D3D9 save thumbnail injection |
+
+## Build (macOS / Rosetta 2)
+
+Requires Xcode Command Line Tools and mingw-w64.
+
+```bash
+./configure --prefix=/usr/local/wine10 --disable-tests --without-x --without-openal
+make -j$(sysctl -n hw.logicalcpu)
+```
+
+Runs as x86_64 binary under Rosetta 2 on Apple Silicon.
+
+## Related
+
+- [Wukiyo](https://github.com/tsukasa-art/Wukiyo) — macOS launcher and HUD that drives the thumbnail injection
+- [Zenn: Mac で美少女ゲームを動かす](https://zenn.dev/tsukasa_art/articles/mac-eroge-compat-part1) — series documenting the compatibility work
+
+---
+
 ## INTRODUCTION
 
 Wine is a program which allows running Microsoft Windows programs
