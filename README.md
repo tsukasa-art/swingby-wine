@@ -2,7 +2,7 @@
 
 Wine fork for running Japanese visual novels on macOS (Apple Silicon / Rosetta 2), built for use with the [Wukiyo](https://github.com/tsukasa-art/Wukiyo) launcher.
 
-Based on **Wine 10.0**.
+Based on [Wine](https://gitlab.winehq.org/wine/wine) (LGPL). `master` tracks Wine 11.x; `wukiyo-thumbnail-injection` is branched from Wine 10.0.
 
 ## Patches
 
@@ -29,7 +29,7 @@ Snap file format: `[u32 width][u32 height][u32 stride] + BGRA pixels (top-down)`
 
 | Branch | Description |
 |---|---|
-| `master` | Wine 10.0 + `macdrv_GetImage` patch |
+| `master` | Wine 11.x + `macdrv_GetImage` patch |
 | `wukiyo-thumbnail-injection` | `master` + D3D9 save thumbnail injection |
 
 ## Build (macOS / Rosetta 2)
