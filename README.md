@@ -43,6 +43,12 @@ make -j$(sysctl -n hw.logicalcpu)
 
 Runs as x86_64 binary under Rosetta 2 on Apple Silicon.
 
+## Notes on D3D9
+
+For D3D9 games (KiriKiriZ, etc.), [d9vk](https://github.com/Joshua-Ashton/d9vk) (D3D9→Vulkan→MoltenVK→Metal) is recommended over wine's built-in wined3d. Wukiyo bundles d9vk and writes `drive_c/dxvk.conf` with `d3d9.presentInterval = 1` at install time to force vsync — without this, KiriKiriZ engines write `waitvsync=no` to their config on first run, causing flickering on Wine+Metal.
+
+D3DMetal (Apple GPTK) covers D3D11/D3D12/DXGI/DDraw but **not** D3D9; d9vk remains the correct path for D3D9 titles.
+
 ## Related
 
 - [Wukiyo](https://github.com/tsukasa-art/Wukiyo) — macOS launcher and HUD that drives the thumbnail injection
