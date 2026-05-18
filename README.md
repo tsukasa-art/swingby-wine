@@ -1,8 +1,8 @@
 # wine-wukiyo
 
-Wine fork for running Japanese visual novels on macOS (Apple Silicon / Rosetta 2), built for use with the [Wukiyo](https://github.com/tsukasa-art/Wukiyo) launcher.
+A personal patch set on top of [Wine](https://gitlab.winehq.org/wine/wine) 10.0, targeting macOS (Apple Silicon / Rosetta 2). Built for use with the [Wukiyo](https://github.com/tsukasa-art/Wukiyo) launcher.
 
-Based on [Wine](https://gitlab.winehq.org/wine/wine) (LGPL). `master` tracks Wine 11.x; `wukiyo-thumbnail-injection` is branched from Wine 10.0.
+Wine is the foundation that makes all of this possible. [Sikarugir](https://github.com/Sikarugir-App/Creator) (formerly Kegworks) provides the macOS app bundle — Wine runtime, DXVK, MoltenVK, and prefix management — that serves as the deployment target for these patches. Both projects do the heavy lifting; this repo only adds the two hooks described below.
 
 ## Patches
 
@@ -27,31 +27,50 @@ Snap file format: `[u32 width][u32 height][u32 stride] + BGRA pixels (top-down)`
 
 ## Branches
 
-| Branch | Description |
-|---|---|
-| `master` | Wine 11.x + `macdrv_GetImage` patch |
-| `wukiyo-thumbnail-injection` | `master` + D3D9 save thumbnail injection |
+| Branch | Base | Contents |
+|---|---|---|
+| `master` | Wine 11.x | `macdrv_GetImage` patch |
+| `wukiyo-thumbnail-injection` | Wine 10.0 | `master` + D3D9 thumbnail injection |
 
 ## Build (macOS / Rosetta 2)
 
-Requires Xcode Command Line Tools and mingw-w64.
+Requires Xcode Command Line Tools and x86_64 Homebrew (`/usr/local/bin/brew`).
 
 ```bash
-./configure --prefix=/usr/local/wine10 --disable-tests --without-x --without-openal
-make -j$(sysctl -n hw.logicalcpu)
+mkdir build && cd build
+arch -x86_64 env \
+  PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig \
+  LDFLAGS="-L/usr/local/lib" CPPFLAGS="-I/usr/local/include" \
+  ../configure -C --enable-win64 --with-mingw \
+  BISON=/usr/local/opt/bison/bin/bison
+arch -x86_64 make -s -j$(sysctl -n hw.activecpu)
 ```
 
-Runs as x86_64 binary under Rosetta 2 on Apple Silicon.
+Produces x86_64 binaries that run under Rosetta 2.
+
+## Deploy into Sikarugir
+
+The built `.so` files replace their counterparts inside a Sikarugir wrapper. ABI must match — build from Wine 10.0 for Sikarugir's `WS12WineSikarugir10.0_x` engine.
+
+```bash
+TARGET=~/Applications/Sikarugir/<GameTitle>.app/Contents/SharedSupport/wine/lib/wine/x86_64-unix/winemac.so
+cp $TARGET ${TARGET}.bak
+cp build/dlls/winemac.drv/winemac.so $TARGET
+codesign --force --sign - $TARGET
+```
+
+**Note on notarization**: Replacing `.so` files invalidates Sikarugir's original notarization for those components. The modified bundle runs on your own Mac (with Terminal listed under Privacy & Security → Developer Tools) but cannot be distributed to others. A proper Developer ID certificate and re-notarization would be required for distribution — that is out of scope for this personal project at the moment.
 
 ## Notes on D3D9
 
-For D3D9 games (KiriKiriZ, etc.), [d9vk](https://github.com/Joshua-Ashton/d9vk) (D3D9→Vulkan→MoltenVK→Metal) is recommended over wine's built-in wined3d. Wukiyo bundles d9vk and writes `drive_c/dxvk.conf` with `d3d9.presentInterval = 1` at install time to force vsync — without this, KiriKiriZ engines write `waitvsync=no` to their config on first run, causing flickering on Wine+Metal.
+For D3D9 games (KiriKiriZ, etc.), [d9vk](https://github.com/Joshua-Ashton/d9vk) (D3D9→Vulkan→MoltenVK→Metal) is recommended over Wine's built-in wined3d. Wukiyo bundles d9vk and writes `drive_c/dxvk.conf` with `d3d9.presentInterval = 1` at install time to force vsync — without this, KiriKiriZ engines write `waitvsync=no` to their `.cfu` config on first run, causing flickering on Wine+Metal.
 
 D3DMetal (Apple GPTK) covers D3D11/D3D12/DXGI/DDraw but **not** D3D9; d9vk remains the correct path for D3D9 titles.
 
 ## Related
 
 - [Wukiyo](https://github.com/tsukasa-art/Wukiyo) — macOS launcher and HUD that drives the thumbnail injection
+- [Sikarugir](https://github.com/Sikarugir-App/Creator) — Wine wrapper for macOS that provides the deployment target
 - [Zenn: Mac で美少女ゲームを動かす](https://zenn.dev/tsukasa_art/articles/mac-eroge-compat-part1) — series documenting the compatibility work
 
 ---
