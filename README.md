@@ -1,8 +1,8 @@
 # wine-wukiyo
 
-A personal patch set on top of [Wine](https://gitlab.winehq.org/wine/wine) 10.0, targeting macOS (Apple Silicon / Rosetta 2). Built for use with the [Wukiyo](https://github.com/tsukasa-art/Wukiyo) launcher.
+A personal patch set forked from [Sikarugir-App/wine](https://github.com/Sikarugir-App/wine) (Wine 10.0, LGPL), targeting macOS (Apple Silicon / Rosetta 2). Built for use with the [Wukiyo](https://github.com/tsukasa-art/Wukiyo) launcher.
 
-Wine is the foundation that makes all of this possible. [Sikarugir](https://github.com/Sikarugir-App/Creator) (formerly Kegworks) provides the macOS app bundle — Wine runtime, DXVK, MoltenVK, and prefix management — that serves as the deployment target for these patches. Both projects do the heavy lifting; this repo only adds the two hooks described below.
+[Wine](https://gitlab.winehq.org/wine/wine) is the foundation that makes all of this possible. [Sikarugir](https://github.com/Sikarugir-App/Creator) (formerly Kegworks) maintains the macOS-specific Wine fork this repo is based on, and provides the app bundle — Wine runtime, DXVK, MoltenVK, and prefix management — that serves as the deployment target for these patches. Both projects do the heavy lifting; this repo only adds the two hooks described below.
 
 ## Patches
 
