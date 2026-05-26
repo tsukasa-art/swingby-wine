@@ -380,6 +380,7 @@ void wukiyo_on_stretchrect(IDirect3DSurface9 *dest)
 {
     s_inject_pending_surf = dest;
     s_inject_pending_tick = GetTickCount();
+    wukiyo_free_pix_cache(); /* Fresh snap was just written; invalidate stale cache. */
     { FILE *lg = fopen("Z:\\tmp\\wukiyo_trace.txt","a");
       if (lg) { fprintf(lg,"stretchrect dest=%p\n",(void*)dest); fclose(lg); } }
 }
@@ -403,7 +404,7 @@ static int wukiyo_inject_snap_slot(void *data, unsigned int row_pitch, int slot)
     BYTE        *px = NULL;
     unsigned int fw, fh, fstride;
 
-    /* 1. Try /tmp (live session). */
+    /* 1. Try per-slot snap in /tmp (written by Swift periodic capture). */
     snprintf(path, sizeof(path), "Z:\\tmp\\wukiyo_snap_%03d.bgra", slot);
     if (wukiyo_load_snap_file(path, &px, &fw, &fh, &fstride))
     {
@@ -411,7 +412,7 @@ static int wukiyo_inject_snap_slot(void *data, unsigned int row_pitch, int slot)
         return 1;
     }
 
-    /* 2. Fall back to persistent path (~/.wukiyo_snaps/). */
+    /* 2. Persistent per-slot path (~/.wukiyo_snaps/). */
     {
         const char *home = getenv("HOME");
         if (home)
@@ -424,6 +425,7 @@ static int wukiyo_inject_snap_slot(void *data, unsigned int row_pitch, int slot)
             }
         }
     }
+
     return 0;
 }
 
@@ -747,19 +749,76 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
         locked_rect->Pitch = map_desc.row_pitch;
         locked_rect->pBits = map_desc.data;
 
-        /* Counter-based injection: schedule snap inject for EVERY 192x108 slot on screen. */
+        /* Log ALL LockRect calls (size + flags) to identify CMVS's capture path. */
         if (map_desc.data)
         {
             struct wined3d_sub_resource_desc _d;
             wined3d_texture_get_sub_resource_desc(surface->wined3d_texture,
                 surface->sub_resource_idx, &_d);
+            { static DWORD s_lr_throttle = 0; DWORD _now = GetTickCount();
+              if ((_d.width != 192 || _d.height != 108) && (DWORD)(_now - s_lr_throttle) > 200) {
+                FILE *lg2 = fopen("Z:\\tmp\\wukiyo_lock.txt","a");
+                if (lg2) { fprintf(lg2,"LockRect %ux%u flags=0x%lx acc=0x%x\n",
+                    _d.width,_d.height,(unsigned long)flags,_d.access); fclose(lg2); s_lr_throttle=_now; } } }
+
+            /* Intercept screenshot capture: CMVS locks a full-resolution GPU surface
+             * (acc=0xd) with READONLY to read pixel data for the save thumbnail.
+             * GetRenderTargetData fills it with black on Metal; inject our snap so
+             * CMVS encodes the correct frame directly into .dat — no reopen needed. */
+            if ((flags & 0x10) /* D3DLOCK_READONLY */
+                && (_d.access == 0xd)
+                && (_d.width >= 640) && (_d.height >= 400))
+            {
+                BYTE *px = NULL; unsigned int fw, fh, fs;
+                if (wukiyo_load_snap_uncached("Z:\\tmp\\wukiyo_snap.bgra", &px, &fw, &fh, &fs))
+                {
+                    /* Scale snap → surface dimensions (usually 1:1, snap is same res). */
+                    unsigned int dy, dx;
+                    for (dy = 0; dy < _d.height; dy++) {
+                        unsigned int sy = (unsigned int)((UINT64)dy * fh / _d.height);
+                        const BYTE *src = px + (SIZE_T)sy * fs;
+                        BYTE *dst = (BYTE *)map_desc.data + (SIZE_T)dy * map_desc.row_pitch;
+                        for (dx = 0; dx < _d.width; dx++) {
+                            unsigned int sx = (unsigned int)((UINT64)dx * fw / _d.width);
+                            dst[dx*4+0] = src[sx*4+0];
+                            dst[dx*4+1] = src[sx*4+1];
+                            dst[dx*4+2] = src[sx*4+2];
+                            dst[dx*4+3] = 0xFF;
+                        }
+                    }
+                    HeapFree(GetProcessHeap(), 0, px);
+                    { FILE *lg = fopen("Z:\\tmp\\wukiyo_lock.txt","a");
+                      if (lg) { fprintf(lg,"INJECT_SNAP %ux%u snap=%ux%u\n",
+                          _d.width,_d.height,fw,fh); fclose(lg); } }
+                }
+            }
+
             if (_d.width == 192 && _d.height == 108)
             {
+                /* Save-path injection: game is about to READ this surface to encode .dat.
+                 * Inject wukiyo_snap.bgra NOW (before the game reads) so the correct
+                 * game frame ends up in the save file — no async Swift patching needed. */
+                if (iface == s_inject_pending_surf && s_inject_pending_tick != 0
+                    && (DWORD)(GetTickCount() - s_inject_pending_tick) < 2000)
+                {
+                    BYTE *px = NULL; unsigned int fw, fh, fs;
+                    if (wukiyo_load_snap_uncached("Z:\\tmp\\wukiyo_snap.bgra",
+                                                  &px, &fw, &fh, &fs))
+                    {
+                        wukiyo_blit(map_desc.data, map_desc.row_pitch, px, fw, fh, fs);
+                        HeapFree(GetProcessHeap(), 0, px);
+                        { FILE *lg = fopen("Z:\\tmp\\wukiyo_trace.txt","a");
+                          if (lg) { fprintf(lg,"lockrect_inject ok %ux%u\n",fw,fh); fclose(lg); } }
+                    }
+                    s_inject_pending_surf = NULL;
+                    s_inject_pending_tick = 0;
+                }
+
                 DWORD now = GetTickCount();
                 BOOL  new_seq = (s_192_last_tick == 0 || (DWORD)(now - s_192_last_tick) > 2000);
                 s_192_last_tick = now;
                 /* Tell device.c to pause auto-capture: save screen is open. */
-                wukiyo_save_screen_cooldown = 1800; /* ~30s at 60fps; keep paused while save screen is open */
+                wukiyo_save_screen_cooldown = 180; /* ~3s at 60fps; paused while screen open, resumes 3s after close */
 
                 if (new_seq)
                 {
@@ -845,12 +904,17 @@ static HRESULT WINAPI d3d9_surface_UnlockRect(IDirect3DSurface9 *iface)
 static HRESULT WINAPI d3d9_surface_GetDC(IDirect3DSurface9 *iface, HDC *dc)
 {
     struct d3d9_surface *surface = impl_from_IDirect3DSurface9(iface);
+    struct wined3d_sub_resource_desc _d;
     HRESULT hr;
 
     TRACE("iface %p, dc %p.\n", iface, dc);
 
     wined3d_mutex_lock();
     hr = wined3d_texture_get_dc(surface->wined3d_texture, surface->sub_resource_idx, dc);
+    wined3d_texture_get_sub_resource_desc(surface->wined3d_texture, surface->sub_resource_idx, &_d);
+    { FILE *lg = fopen("Z:\\tmp\\wukiyo_getdc.txt","a");
+      if (lg) { fprintf(lg,"GetDC hr=0x%08x surf=%p %ux%u dc=%p\n",
+          (unsigned)hr,(void*)iface,_d.width,_d.height,dc?*dc:NULL); fclose(lg); } }
     wined3d_mutex_unlock();
 
     return hr;
@@ -859,12 +923,17 @@ static HRESULT WINAPI d3d9_surface_GetDC(IDirect3DSurface9 *iface, HDC *dc)
 static HRESULT WINAPI d3d9_surface_ReleaseDC(IDirect3DSurface9 *iface, HDC dc)
 {
     struct d3d9_surface *surface = impl_from_IDirect3DSurface9(iface);
+    struct wined3d_sub_resource_desc _d;
     HRESULT hr;
 
     TRACE("iface %p, dc %p.\n", iface, dc);
 
     wined3d_mutex_lock();
     hr = wined3d_texture_release_dc(surface->wined3d_texture, surface->sub_resource_idx, dc);
+    wined3d_texture_get_sub_resource_desc(surface->wined3d_texture, surface->sub_resource_idx, &_d);
+    { FILE *lg = fopen("Z:\\tmp\\wukiyo_getdc.txt","a");
+      if (lg) { fprintf(lg,"ReleaseDC hr=0x%08x surf=%p %ux%u dc=%p\n",
+          (unsigned)hr,(void*)iface,_d.width,_d.height,(void*)dc); fclose(lg); } }
     if (SUCCEEDED(hr) && surface->texture)
         d3d9_texture_flag_auto_gen_mipmap(surface->texture);
     wined3d_mutex_unlock();

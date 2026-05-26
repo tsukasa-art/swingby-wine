@@ -1253,6 +1253,10 @@ static HRESULT WINAPI DECLSPEC_HOTPATCH d3d9_device_Reset(IDirect3DDevice9Ex *if
 }
 
 static void wukiyo_capture_frontbuffer(IDirect3DDevice9Ex *iface, struct d3d9_device *device);
+static void wukiyo_capture_rt_to_snap(IDirect3DDevice9Ex *iface, struct d3d9_device *device, struct d3d9_surface *src_impl);
+static HRESULT WINAPI d3d9_device_CreateOffscreenPlainSurface(IDirect3DDevice9Ex *iface,
+        UINT width, UINT height, D3DFORMAT format, D3DPOOL pool,
+        IDirect3DSurface9 **surface, HANDLE *shared_handle);
 
 static HRESULT WINAPI DECLSPEC_HOTPATCH d3d9_device_Present(IDirect3DDevice9Ex *iface,
         const RECT *src_rect, const RECT *dst_rect, HWND dst_window_override, const RGNDATA *dirty_region)
@@ -1863,6 +1867,10 @@ static HRESULT WINAPI d3d9_device_UpdateTexture(IDirect3DDevice9Ex *iface,
     return hr;
 }
 
+/* Forward declaration — defined later in this file. */
+static void wukiyo_capture_rt_to_snap(IDirect3DDevice9Ex *iface,
+    struct d3d9_device *device, struct d3d9_surface *src_impl);
+
 static HRESULT WINAPI d3d9_device_GetRenderTargetData(IDirect3DDevice9Ex *iface,
         IDirect3DSurface9 *render_target, IDirect3DSurface9 *dst_surface)
 {
@@ -1884,17 +1892,9 @@ static HRESULT WINAPI d3d9_device_GetRenderTargetData(IDirect3DDevice9Ex *iface,
     /* Wukiyo: check thumbnail size before any early return. */
     wined3d_texture_get_sub_resource_desc(dst_impl->wined3d_texture, dst_impl->sub_resource_idx, &wined3d_desc);
     dst_is_192x108 = (wined3d_desc.width == 192 && wined3d_desc.height == 108);
-    { struct wined3d_sub_resource_desc _src_desc;
-      wined3d_texture_get_sub_resource_desc(rt_impl->wined3d_texture, rt_impl->sub_resource_idx, &_src_desc);
-      if (wined3d_desc.width < 1024 || _src_desc.width < 1024) {
-        FILE *lg = fopen("Z:\\tmp\\wukiyo_trace.txt","a");
-        if (lg) { fprintf(lg,"getrtdata src=%ux%u dst=%ux%u\n",
-            _src_desc.width,_src_desc.height,wined3d_desc.width,wined3d_desc.height); fclose(lg); }
-      }
-    }
 
-    /* On Metal-backed GL, GL readback from render targets returns black.
-     * Try to satisfy the request from the CG-captured front buffer SYSMEM instead. */
+    /* CG compositor path (restored for all surfaces — removing it caused startup crash
+     * because wined3d_device_context_blt is not safe during device initialization). */
     if (device->implicit_swapchain_count > 0)
     {
         hr = wined3d_swapchain_get_front_buffer_data(device->implicit_swapchains[0],
@@ -1902,7 +1902,10 @@ static HRESULT WINAPI d3d9_device_GetRenderTargetData(IDirect3DDevice9Ex *iface,
         if (SUCCEEDED(hr))
         {
             wined3d_mutex_unlock();
-            if (dst_is_192x108)
+            if (!dst_is_192x108)
+                /* Capture fresh snap from the exact RT CMVS is about to thumbnail. */
+                wukiyo_capture_rt_to_snap(iface, device, rt_impl);
+            else
             { extern void wukiyo_on_get_render_target_data(IDirect3DSurface9 *s, IDirect3DSurface9 *d);
               wukiyo_on_get_render_target_data(render_target, dst_surface); }
             return hr;
@@ -1923,10 +1926,16 @@ static HRESULT WINAPI d3d9_device_GetRenderTargetData(IDirect3DDevice9Ex *iface,
                 dst_impl->wined3d_texture, dst_impl->sub_resource_idx, &dst_rect,
                 rt_impl->wined3d_texture, rt_impl->sub_resource_idx, &src_rect, 0, NULL, WINED3D_TEXF_POINT);
     wined3d_mutex_unlock();
-    if (SUCCEEDED(hr) && dst_is_192x108)
+    if (SUCCEEDED(hr))
     {
-        extern void wukiyo_on_get_render_target_data(IDirect3DSurface9 *s, IDirect3DSurface9 *d);
-        wukiyo_on_get_render_target_data(render_target, dst_surface);
+        if (!dst_is_192x108)
+            /* Capture fresh snap from the exact RT CMVS is about to thumbnail. */
+            wukiyo_capture_rt_to_snap(iface, device, rt_impl);
+        else
+        {
+            extern void wukiyo_on_get_render_target_data(IDirect3DSurface9 *s, IDirect3DSurface9 *d);
+            wukiyo_on_get_render_target_data(render_target, dst_surface);
+        }
     }
     return hr;
 }
@@ -2008,11 +2017,13 @@ static HRESULT WINAPI d3d9_device_StretchRect(IDirect3DDevice9Ex *iface, IDirect
         src_rect = &s;
     }
 
-    /* Wukiyo: log ALL StretchRect calls involving 192x108 (before pool checks reject them). */
-    if (dst_desc.width == 192 && dst_desc.height == 108)
-    { FILE *lg = fopen("Z:\\tmp\\wukiyo_stretch.txt","a");
-      if (lg) { fprintf(lg,"stretch192 src=%ux%u dst_access=0x%x src_access=0x%x\n",
-          src_desc.width,src_desc.height,dst_desc.access,src_desc.access); fclose(lg); } }
+    /* Wukiyo: log ALL StretchRect calls so we can identify CMVS's capture path. */
+    { static DWORD s_sr_throttle = 0; DWORD _now = GetTickCount();
+      if ((DWORD)(_now - s_sr_throttle) > 500) { /* log at most every 0.5s to avoid spam */
+        FILE *lg = fopen("Z:\\tmp\\wukiyo_stretch.txt","a");
+        if (lg) { fprintf(lg,"StretchRect src=%ux%u(acc=0x%x) dst=%ux%u(acc=0x%x)\n",
+            src_desc.width,src_desc.height,src_desc.access,
+            dst_desc.width,dst_desc.height,dst_desc.access); fclose(lg); s_sr_throttle=_now; } } }
 
     if (dst_desc.access & WINED3D_RESOURCE_ACCESS_CPU)
     {
@@ -2062,18 +2073,55 @@ static HRESULT WINAPI d3d9_device_StretchRect(IDirect3DDevice9Ex *iface, IDirect
         }
     }
 
-    /* Wukiyo approach B: for thumbnail captures (dst=192x108), the normal GPU blit
-     * returns black on Metal. Use the CG compositor front-buffer path instead so the
-     * game gets the actual game frame and can write it to .dat itself. */
-    if (dst_desc.width == 192 && dst_desc.height == 108 && device->implicit_swapchain_count > 0)
+    /* Wukiyo: for thumbnail captures (dst=192x108), capture the src surface at full
+     * resolution using the wined3d GPU→SYSMEM blit path (proven to work in
+     * wukiyo_capture_frontbuffer).  Write to wukiyo_snap.bgra and tag dst so that
+     * the subsequent LockRect can inject our pixels before the game encodes the .dat.
+     * The CG compositor path (get_front_buffer_data) returns black on Metal and is
+     * no longer used here. */
+    if (dst_desc.width == 192 && dst_desc.height == 108)
     {
-        HRESULT cg_hr = wined3d_swapchain_get_front_buffer_data(
-                device->implicit_swapchains[0], dst->wined3d_texture, dst->sub_resource_idx);
-        { FILE *lg = fopen("Z:\\tmp\\wukiyo_stretch.txt", "a");
-          if (lg) { fprintf(lg, "stretch192 cg_hr=0x%08x src=%ux%u dst=%ux%u\n",
-              (unsigned)cg_hr, src_desc.width, src_desc.height, dst_desc.width, dst_desc.height);
-            fclose(lg); } }
-        if (SUCCEEDED(cg_hr)) { hr = D3D_OK; goto done; }
+        IDirect3DSurface9 *sys_surf = NULL;
+        if (SUCCEEDED(d3d9_device_CreateOffscreenPlainSurface(iface,
+                src_desc.width, src_desc.height,
+                d3dformat_from_wined3dformat(src_desc.format),
+                D3DPOOL_SYSTEMMEM, &sys_surf, NULL)))
+        {
+            struct d3d9_surface *sys_impl = unsafe_impl_from_IDirect3DSurface9(sys_surf);
+            RECT blt_r;
+            HRESULT blt_hr;
+            SetRect(&blt_r, 0, 0, (int)src_desc.width, (int)src_desc.height);
+            blt_hr = wined3d_device_context_blt(device->immediate_context,
+                    sys_impl->wined3d_texture, sys_impl->sub_resource_idx, &blt_r,
+                    src->wined3d_texture, src->sub_resource_idx, &blt_r,
+                    0, NULL, WINED3D_TEXF_POINT);
+            if (SUCCEEDED(blt_hr))
+            {
+                D3DLOCKED_RECT lr;
+                if (SUCCEEDED(IDirect3DSurface9_LockRect(sys_surf, &lr, NULL, D3DLOCK_READONLY)))
+                {
+                    FILE *snap_f = fopen("Z:\\tmp\\wukiyo_snap.bgra", "wb");
+                    if (snap_f)
+                    {
+                        UINT32 fw = src_desc.width, fh = src_desc.height;
+                        UINT32 fs = (UINT32)lr.Pitch;
+                        UINT r;
+                        fwrite(&fw, 4, 1, snap_f); fwrite(&fh, 4, 1, snap_f);
+                        fwrite(&fs, 4, 1, snap_f);
+                        for (r = 0; r < fh; r++)
+                            fwrite((char*)lr.pBits + (size_t)r * lr.Pitch, fw * 4, 1, snap_f);
+                        fclose(snap_f);
+                    }
+                    IDirect3DSurface9_UnlockRect(sys_surf);
+                }
+            }
+            IDirect3DSurface9_Release(sys_surf);
+            { FILE *lg = fopen("Z:\\tmp\\wukiyo_stretch.txt","a");
+              if (lg) { fprintf(lg,"stretch192 snap_written blt_hr=0x%08x src=%ux%u\n",
+                  (unsigned)blt_hr,src_desc.width,src_desc.height); fclose(lg); } }
+        }
+        { extern void wukiyo_on_stretchrect(IDirect3DSurface9 *d);
+          wukiyo_on_stretchrect(dst_surface); }
     }
 
     hr = wined3d_device_context_blt(device->immediate_context, dst->wined3d_texture,
@@ -2201,6 +2249,63 @@ static HRESULT WINAPI d3d9_device_CreateOffscreenPlainSurface(IDirect3DDevice9Ex
             WINED3D_MULTISAMPLE_NONE, 0, usage, 0, access, width, height, user_mem, surface);
 }
 
+/* Capture any GPU surface → wukiyo_snap.bgra via wined3d_device_context_blt.
+ * Call WITHOUT holding the wined3d mutex (same calling convention as
+ * wukiyo_capture_frontbuffer).  Used for on-demand thumbnail capture from the
+ * exact render target CMVS reads, so we get fresh, HUD-free content. */
+static void wukiyo_capture_rt_to_snap(IDirect3DDevice9Ex *iface,
+    struct d3d9_device *device, struct d3d9_surface *src_impl)
+{
+    static const char snap_out[] = "Z:\\tmp\\wukiyo_snap.bgra";
+    static DWORD s_last_rt_snap = 0;
+    IDirect3DSurface9 *sys = NULL;
+    struct d3d9_surface *sys_impl;
+    D3DSURFACE_DESC sd;
+    D3DLOCKED_RECT lr;
+    HRESULT hr;
+    RECT r;
+    UINT row;
+    DWORD now;
+
+    if (!device->implicit_swapchain_count) return;
+
+    now = GetTickCount();
+    if ((DWORD)(now - s_last_rt_snap) < 50) return;
+    s_last_rt_snap = now;
+
+    if (FAILED(IDirect3DSurface9_GetDesc(&src_impl->IDirect3DSurface9_iface, &sd)))
+        return;
+
+    if (FAILED(d3d9_device_CreateOffscreenPlainSurface(iface, sd.Width, sd.Height,
+            sd.Format, D3DPOOL_SYSTEMMEM, &sys, NULL)))
+        return;
+    sys_impl = unsafe_impl_from_IDirect3DSurface9(sys);
+
+    SetRect(&r, 0, 0, sd.Width, sd.Height);
+    wined3d_mutex_lock();
+    hr = wined3d_device_context_blt(device->immediate_context,
+            sys_impl->wined3d_texture, sys_impl->sub_resource_idx, &r,
+            src_impl->wined3d_texture,  src_impl->sub_resource_idx, &r,
+            0, NULL, WINED3D_TEXF_POINT);
+    wined3d_mutex_unlock();
+
+    if (SUCCEEDED(hr) && SUCCEEDED(IDirect3DSurface9_LockRect(sys, &lr, NULL, D3DLOCK_READONLY)))
+    {
+        FILE *f = fopen(snap_out, "wb");
+        if (f) {
+            uint32_t w = sd.Width, h = sd.Height, s = (uint32_t)lr.Pitch;
+            fwrite(&w, 4, 1, f); fwrite(&h, 4, 1, f); fwrite(&s, 4, 1, f);
+            for (row = 0; row < sd.Height; row++)
+                fwrite((char*)lr.pBits + (size_t)row * lr.Pitch, sd.Width * 4, 1, f);
+            fclose(f);
+            { FILE *lg = fopen("Z:\\tmp\\wukiyo_lock.txt","a");
+              if (lg) { fprintf(lg,"RT_TO_SNAP ok %ux%u\n",sd.Width,sd.Height); fclose(lg); } }
+        }
+        IDirect3DSurface9_UnlockRect(sys);
+    }
+    IDirect3DSurface9_Release(sys);
+}
+
 /* Capture the back buffer to /tmp/wukiyo_snap.bgra.
  * Runs automatically every 60 Present calls (~1 s at 60 fps) so the snap is
  * always a recent game frame without requiring the user to press a button.
@@ -2223,11 +2328,8 @@ static void wukiyo_capture_frontbuffer(IDirect3DDevice9Ex *iface, struct d3d9_de
     { FILE *t = fopen(snap_trigger, "rb");
       if (t) { fclose(t); remove(snap_trigger); is_trigger = TRUE; auto_frame = 0; }
       else {
-          /* Pause auto-capture while the save screen is open (192x108 LockRects firing).
-           * wukiyo_save_screen_cooldown is set to 120 by surface.c on each 192x108 LockRect
-           * and decays here; when it reaches 0 the save screen has been closed for ~2 s. */
           if (wukiyo_save_screen_cooldown > 0) { wukiyo_save_screen_cooldown--; return; }
-          if (++auto_frame < 60) return;
+          if (++auto_frame < 15) return;
           auto_frame = 0; is_trigger = FALSE;
       } }
 
