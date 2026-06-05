@@ -890,20 +890,22 @@ static BOOL wukiyo_fill_shadow_from_last_good(IDirect3DSurface9 *iface,
         DWORD flags, const struct wined3d_map_desc *map_desc, unsigned long avg)
 {
     DWORD now = GetTickCount();
+    DWORD max_age = wukiyo_save_screen_cooldown ? 120000 : 5000;
     SIZE_T row_bytes = (SIZE_T)desc->width * 4;
     unsigned int y;
     FILE *lg;
 
     if (avg == (unsigned long)-1 || avg > 4)
         return FALSE;
-    if (!s_last_good_frame || !s_last_good_tick || (DWORD)(now - s_last_good_tick) > 5000)
+    if (!s_last_good_frame || !s_last_good_tick || (DWORD)(now - s_last_good_tick) > max_age)
     {
         lg = fopen("Z:\\tmp\\wukiyo_lock_detail.txt", "a");
         if (lg)
         {
             fprintf(lg,
-                    "LOCK_SHADOW_FILL_SKIP no_recent_last_good surf=%p age=%lu has=%u tick=%lu avg_before=%lu\n",
+                    "LOCK_SHADOW_FILL_SKIP no_recent_last_good surf=%p age=%lu max_age=%lu cooldown=%u has=%u tick=%lu avg_before=%lu\n",
                     (void *)iface, s_last_good_tick ? (unsigned long)(now - s_last_good_tick) : 0,
+                    (unsigned long)max_age, wukiyo_save_screen_cooldown,
                     s_last_good_frame ? 1 : 0, (unsigned long)s_last_good_tick, avg);
             fclose(lg);
         }
