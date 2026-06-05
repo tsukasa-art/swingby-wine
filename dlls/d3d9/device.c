@@ -2307,17 +2307,15 @@ static void wukiyo_capture_rt_to_snap(IDirect3DDevice9Ex *iface,
     IDirect3DSurface9_Release(sys);
 }
 
-/* Capture the back buffer to /tmp/wukiyo_snap.bgra.
- * Runs automatically every 60 Present calls (~1 s at 60 fps) so the snap is
- * always a recent game frame without requiring the user to press a button.
- * Also fires immediately when the trigger file wukiyo_take_snap exists
- * (camera button path). */
+/* Capture the back buffer to an in-process last-good frame every Present.
+ * The disk snap is still rate-limited; the hot path is for CMVS saves where the
+ * scene can change immediately before the save menu reads its thumbnail RT. */
 static void wukiyo_capture_frontbuffer(IDirect3DDevice9Ex *iface, struct d3d9_device *device)
 {
     static const char snap_trigger[] = "Z:\\tmp\\wukiyo_take_snap";
     static const char snap_out[]     = "Z:\\tmp\\wukiyo_snap.bgra";
     static const char snap_ready[]   = "Z:\\tmp\\wukiyo_snap_ready";
-    static UINT auto_frame = 0;
+    static UINT snap_file_frame = 0;
     IDirect3DSurface9 *bb = NULL, *sys = NULL;
     D3DSURFACE_DESC desc;
     D3DLOCKED_RECT lr;
@@ -2325,13 +2323,16 @@ static void wukiyo_capture_frontbuffer(IDirect3DDevice9Ex *iface, struct d3d9_de
     FILE *f;
     UINT row;
     BOOL is_trigger;
+    BOOL write_snap;
 
     { FILE *t = fopen(snap_trigger, "rb");
-      if (t) { fclose(t); remove(snap_trigger); is_trigger = TRUE; auto_frame = 0; }
+      if (t) { fclose(t); remove(snap_trigger); is_trigger = TRUE; write_snap = TRUE; snap_file_frame = 0; }
       else {
           if (wukiyo_save_screen_cooldown > 0) { wukiyo_save_screen_cooldown--; return; }
-          if (++auto_frame < 15) return;
-          auto_frame = 0; is_trigger = FALSE;
+          is_trigger = FALSE;
+          write_snap = ++snap_file_frame >= 15;
+          if (write_snap)
+              snap_file_frame = 0;
       } }
 
     if (!device->implicit_swapchain_count) return;
@@ -2366,18 +2367,21 @@ static void wukiyo_capture_frontbuffer(IDirect3DDevice9Ex *iface, struct d3d9_de
     wukiyo_rt_capture_active = TRUE;
     if (SUCCEEDED(IDirect3DSurface9_LockRect(sys, &lr, NULL, D3DLOCK_READONLY)))
     {
-        f = fopen(snap_out, "wb");
-        if (f)
+        if (write_snap)
         {
-            uint32_t w = desc.Width, h = desc.Height, s = (uint32_t)lr.Pitch;
-            fwrite(&w, 4, 1, f);
-            fwrite(&h, 4, 1, f);
-            fwrite(&s, 4, 1, f);
-            for (row = 0; row < desc.Height; row++)
-                fwrite((char *)lr.pBits + (size_t)row * lr.Pitch, desc.Width * 4, 1, f);
-            fclose(f);
-            wukiyo_snap_tick = GetTickCount();
-            if (is_trigger) { f = fopen(snap_ready, "wb"); if (f) fclose(f); }
+            f = fopen(snap_out, "wb");
+            if (f)
+            {
+                uint32_t w = desc.Width, h = desc.Height, s = (uint32_t)lr.Pitch;
+                fwrite(&w, 4, 1, f);
+                fwrite(&h, 4, 1, f);
+                fwrite(&s, 4, 1, f);
+                for (row = 0; row < desc.Height; row++)
+                    fwrite((char *)lr.pBits + (size_t)row * lr.Pitch, desc.Width * 4, 1, f);
+                fclose(f);
+                wukiyo_snap_tick = GetTickCount();
+                if (is_trigger) { f = fopen(snap_ready, "wb"); if (f) fclose(f); }
+            }
         }
         IDirect3DSurface9_UnlockRect(sys);
     }

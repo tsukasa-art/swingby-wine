@@ -848,6 +848,43 @@ static void wukiyo_remember_last_good_frame(const struct wined3d_sub_resource_de
     }
 }
 
+static void wukiyo_write_last_good_snap_file(void)
+{
+    static const char snap_out[] = "Z:\\tmp\\wukiyo_snap.bgra";
+    uint32_t w, h, s;
+    unsigned int y;
+    FILE *f;
+    FILE *lg;
+
+    if (!s_last_good_frame || !s_last_good_width || !s_last_good_height || !s_last_good_stride)
+        return;
+
+    f = fopen(snap_out, "wb");
+    if (!f)
+        return;
+
+    w = s_last_good_width;
+    h = s_last_good_height;
+    s = s_last_good_stride;
+    fwrite(&w, 4, 1, f);
+    fwrite(&h, 4, 1, f);
+    fwrite(&s, 4, 1, f);
+    for (y = 0; y < s_last_good_height; y++)
+        fwrite(s_last_good_frame + (SIZE_T)y * s_last_good_stride,
+                s_last_good_width * 4, 1, f);
+    fclose(f);
+
+    wukiyo_snap_tick = GetTickCount();
+
+    lg = fopen("Z:\\tmp\\wukiyo_lock_detail.txt", "a");
+    if (lg)
+    {
+        fprintf(lg, "SNAP_FROM_LAST_GOOD 1280x720 avg=%lu tick=%lu\n",
+                s_last_good_avg, (unsigned long)wukiyo_snap_tick);
+        fclose(lg);
+    }
+}
+
 static BOOL wukiyo_fill_shadow_from_last_good(IDirect3DSurface9 *iface,
         const struct wined3d_sub_resource_desc *desc, const RECT *rect,
         DWORD flags, const struct wined3d_map_desc *map_desc, unsigned long avg)
@@ -902,6 +939,7 @@ static BOOL wukiyo_fill_shadow_from_last_good(IDirect3DSurface9 *iface,
                 (unsigned long)(now - s_last_good_tick), avg, s_last_good_avg);
         fclose(lg);
     }
+    wukiyo_write_last_good_snap_file();
     return TRUE;
 }
 
