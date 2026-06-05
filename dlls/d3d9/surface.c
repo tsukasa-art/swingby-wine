@@ -741,11 +741,14 @@ static IDirect3DSurface9 *s_unlock_iface     = NULL;
 static void              *s_unlock_data      = NULL;
 static unsigned int       s_unlock_pitch     = 0;
 static int                s_unlock_slot      = -1;
+static IDirect3DSurface9 *s_shadow_lock_iface = NULL;
+static IDirect3DSurface9 *s_shadow_lock_surface = NULL;
 
 static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
         D3DLOCKED_RECT *locked_rect, const RECT *rect, DWORD flags)
 {
     struct d3d9_surface *surface = impl_from_IDirect3DSurface9(iface);
+    struct wined3d_sub_resource_desc desc;
     struct wined3d_box box;
     struct wined3d_map_desc map_desc;
     HRESULT hr;
@@ -754,6 +757,85 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
             iface, locked_rect, wine_dbgstr_rect(rect), flags);
     if (rect)
         wined3d_box_set(&box, rect->left, rect->top, rect->right, rect->bottom, 0, 1);
+
+    wined3d_mutex_lock();
+    wined3d_texture_get_sub_resource_desc(surface->wined3d_texture, surface->sub_resource_idx, &desc);
+    wined3d_mutex_unlock();
+
+    /* CMVS sometimes reads the save thumbnail from a lockable render target
+     * directly instead of using GetRenderTargetData.  On the Metal-backed path,
+     * mapping that GPU RT can return black.  For this read-only capture case,
+     * copy the RT into a sysmem shadow first and hand CMVS the shadow map. */
+    if (!rect
+            && (flags & D3DLOCK_READONLY)
+            && !wukiyo_rt_capture_active
+            && !s_shadow_lock_surface
+            && desc.access == (WINED3D_RESOURCE_ACCESS_GPU
+                    | WINED3D_RESOURCE_ACCESS_MAP_R | WINED3D_RESOURCE_ACCESS_MAP_W)
+            && (desc.bind_flags & WINED3D_BIND_RENDER_TARGET)
+            && desc.width >= 640 && desc.height >= 400)
+    {
+        IDirect3DSurface9 *shadow = NULL;
+        struct d3d9_surface *shadow_impl;
+        struct d3d9_device *device = CONTAINING_RECORD(surface->parent_device,
+                struct d3d9_device, IDirect3DDevice9Ex_iface);
+        RECT full_rect;
+
+        if (SUCCEEDED(IDirect3DDevice9Ex_CreateOffscreenPlainSurface(surface->parent_device,
+                desc.width, desc.height, d3dformat_from_wined3dformat(desc.format),
+                D3DPOOL_SYSTEMMEM, &shadow, NULL)))
+        {
+            shadow_impl = unsafe_impl_from_IDirect3DSurface9(shadow);
+            SetRect(&full_rect, 0, 0, desc.width, desc.height);
+
+            wined3d_mutex_lock();
+            hr = wined3d_device_context_blt(device->immediate_context,
+                    shadow_impl->wined3d_texture, shadow_impl->sub_resource_idx, &full_rect,
+                    surface->wined3d_texture, surface->sub_resource_idx, &full_rect,
+                    0, NULL, WINED3D_TEXF_POINT);
+            wined3d_mutex_unlock();
+
+            if (SUCCEEDED(hr))
+            {
+                hr = wined3d_resource_map(wined3d_texture_get_resource(shadow_impl->wined3d_texture),
+                        shadow_impl->sub_resource_idx, &map_desc, NULL,
+                        wined3dmapflags_from_d3dmapflags(flags, 0));
+                if (SUCCEEDED(hr))
+                {
+                    locked_rect->Pitch = map_desc.row_pitch;
+                    locked_rect->pBits = map_desc.data;
+                    s_shadow_lock_iface = iface;
+                    s_shadow_lock_surface = shadow;
+                    {
+                        FILE *lg = fopen("Z:\\tmp\\wukiyo_lock.txt","a");
+                        if (lg)
+                        {
+                            fprintf(lg,
+                                    "LOCK_SHADOW_RT src=%p shadow=%p %ux%u flags=0x%lx acc=0x%x bind=0x%x pitch=%u\n",
+                                    (void *)iface, (void *)shadow, desc.width, desc.height,
+                                    (unsigned long)flags, desc.access, desc.bind_flags,
+                                    map_desc.row_pitch);
+                            fclose(lg);
+                        }
+                    }
+                    return D3D_OK;
+                }
+            }
+
+            {
+                FILE *lg = fopen("Z:\\tmp\\wukiyo_lock.txt","a");
+                if (lg)
+                {
+                    fprintf(lg,
+                            "LOCK_SHADOW_RT_FAIL src=%p %ux%u flags=0x%lx hr=0x%08lx\n",
+                            (void *)iface, desc.width, desc.height,
+                            (unsigned long)flags, (unsigned long)hr);
+                    fclose(lg);
+                }
+            }
+            IDirect3DSurface9_Release(shadow);
+        }
+    }
 
     hr = wined3d_resource_map(wined3d_texture_get_resource(surface->wined3d_texture), surface->sub_resource_idx,
             &map_desc, rect ? &box : NULL, wined3dmapflags_from_d3dmapflags(flags, 0));
@@ -766,15 +848,12 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
         /* Log ALL LockRect calls (size + flags) to identify CMVS's capture path. */
         if (map_desc.data)
         {
-            struct wined3d_sub_resource_desc _d;
-            wined3d_texture_get_sub_resource_desc(surface->wined3d_texture,
-                surface->sub_resource_idx, &_d);
             { static DWORD s_lr_throttle = 0; DWORD _now = GetTickCount();
               if (!wukiyo_rt_capture_active
-                  && (_d.width != 192 || _d.height != 108) && (DWORD)(_now - s_lr_throttle) > 200) {
+                  && (desc.width != 192 || desc.height != 108) && (DWORD)(_now - s_lr_throttle) > 200) {
                 FILE *lg2 = fopen("Z:\\tmp\\wukiyo_lock.txt","a");
                 if (lg2) { fprintf(lg2,"LockRect %ux%u flags=0x%lx acc=0x%x\n",
-                    _d.width,_d.height,(unsigned long)flags,_d.access); fclose(lg2); s_lr_throttle=_now; } } }
+                    desc.width,desc.height,(unsigned long)flags,desc.access); fclose(lg2); s_lr_throttle=_now; } } }
 
             /* CMVS locks the full-resolution GetRenderTargetData destination
              * surface to encode the save thumbnail.  Do not overwrite it from an
@@ -783,12 +862,12 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
              * LockRect back to the exact GetRenderTargetData destination. */
             {
                 DWORD lock_now = GetTickCount();
-                BOOL capture_access = (_d.access == 0xd) || (_d.access == 0xe);
+                BOOL capture_access = (desc.access == 0xd) || (desc.access == 0xe);
 
                 if ((flags & 0x10) /* D3DLOCK_READONLY */
                     && !wukiyo_rt_capture_active
                     && capture_access
-                    && (_d.width >= 640) && (_d.height >= 400))
+                    && (desc.width >= 640) && (desc.height >= 400))
                 {
                     BOOL matched = iface == s_rtdata_dst_surf
                         && s_rtdata_tick
@@ -801,7 +880,7 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
                             fprintf(lg,
                                 "LOCK_RTDATA_MATCH serial=%u src=%p dst=%p %ux%u flags=0x%lx acc=0x%x pitch=%u age=%lu\n",
                                 s_rtdata_serial,(void*)s_rtdata_src_surf,(void*)iface,
-                                _d.width,_d.height,(unsigned long)flags,_d.access,
+                                desc.width,desc.height,(unsigned long)flags,desc.access,
                                 map_desc.row_pitch,(unsigned long)(lock_now - s_rtdata_tick));
                             fclose(lg);
                         }
@@ -810,7 +889,7 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
                 }
             }
 
-            if (_d.width == 192 && _d.height == 108)
+            if (desc.width == 192 && desc.height == 108)
             {
                 /* Tell device.c to pause auto-capture: save screen is open. */
                 wukiyo_save_screen_cooldown = 1800; /* ~30s at 60fps; keep the pre-save gameplay snap */
@@ -836,6 +915,31 @@ static HRESULT WINAPI d3d9_surface_UnlockRect(IDirect3DSurface9 *iface)
     HRESULT hr;
 
     TRACE("iface %p.\n", iface);
+
+    if (iface == s_shadow_lock_iface && s_shadow_lock_surface)
+    {
+        struct d3d9_surface *shadow = unsafe_impl_from_IDirect3DSurface9(s_shadow_lock_surface);
+
+        wined3d_mutex_lock();
+        hr = wined3d_resource_unmap(wined3d_texture_get_resource(shadow->wined3d_texture),
+                shadow->sub_resource_idx);
+        wined3d_mutex_unlock();
+
+        {
+            FILE *lg = fopen("Z:\\tmp\\wukiyo_lock.txt","a");
+            if (lg)
+            {
+                fprintf(lg, "UNLOCK_SHADOW_RT src=%p shadow=%p hr=0x%08lx\n",
+                        (void *)iface, (void *)s_shadow_lock_surface, (unsigned long)hr);
+                fclose(lg);
+            }
+        }
+
+        IDirect3DSurface9_Release(s_shadow_lock_surface);
+        s_shadow_lock_iface = NULL;
+        s_shadow_lock_surface = NULL;
+        return hr == WINEDDERR_NOTLOCKED ? D3DERR_INVALIDCALL : hr;
+    }
 
     /* Inject snap AFTER game has written its thumbnail data, before unmap.
      * .dat persistence is handled exclusively by the Swift side (patchDatFileThumbnail);
