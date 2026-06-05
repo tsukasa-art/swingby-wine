@@ -250,6 +250,7 @@ static HRESULT WINAPI d3d9_surface_GetDesc(IDirect3DSurface9 *iface, D3DSURFACE_
 
 /* Shared with device.c: pauses auto-capture while save screen is open. */
 extern UINT wukiyo_save_screen_cooldown;
+extern DWORD wukiyo_snap_tick;
 extern DWORD wukiyo_rt_snap_tick;
 extern BOOL wukiyo_rt_capture_active;
 
@@ -763,16 +764,25 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
                 if (lg2) { fprintf(lg2,"LockRect %ux%u flags=0x%lx acc=0x%x\n",
                     _d.width,_d.height,(unsigned long)flags,_d.access); fclose(lg2); s_lr_throttle=_now; } } }
 
-            /* Intercept screenshot capture: CMVS locks a full-resolution GPU surface
-             * (acc=0xd) with READONLY to read pixel data for the save thumbnail.
-             * GetRenderTargetData fills it with black on Metal; inject our snap so
-             * CMVS encodes the correct frame directly into .dat — no reopen needed. */
+            /* Intercept screenshot capture: CMVS locks a full-resolution readback
+             * surface to encode the save thumbnail.  Recent traces show both
+             * acc=0xd and acc=0xe depending on the path.  Prefer a fresh RT snap
+             * when GetRenderTargetData fired; otherwise, while the save screen is
+             * open, fall back to the last pre-save gameplay snap kept by device.c. */
+            {
+                DWORD inject_now = GetTickCount();
+                BOOL fresh_rt_snap = wukiyo_rt_snap_tick
+                    && (DWORD)(inject_now - wukiyo_rt_snap_tick) < 2000;
+                BOOL fresh_saved_snap = wukiyo_snap_tick
+                    && wukiyo_save_screen_cooldown > 0
+                    && (DWORD)(inject_now - wukiyo_snap_tick) < 60000;
+                BOOL capture_access = (_d.access == 0xd) || (_d.access == 0xe);
+
             if ((flags & 0x10) /* D3DLOCK_READONLY */
                 && !wukiyo_rt_capture_active
-                && (_d.access == 0xd)
+                && capture_access
                 && (_d.width >= 640) && (_d.height >= 400)
-                && wukiyo_rt_snap_tick
-                && (DWORD)(GetTickCount() - wukiyo_rt_snap_tick) < 2000)
+                && (fresh_rt_snap || fresh_saved_snap))
             {
                 BYTE *px = NULL; unsigned int fw, fh, fs;
                 if (wukiyo_load_snap_uncached("Z:\\tmp\\wukiyo_snap.bgra", &px, &fw, &fh, &fs))
@@ -793,15 +803,17 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
                     }
                     HeapFree(GetProcessHeap(), 0, px);
                     { FILE *lg = fopen("Z:\\tmp\\wukiyo_lock.txt","a");
-                      if (lg) { fprintf(lg,"INJECT_SNAP %ux%u snap=%ux%u\n",
-                          _d.width,_d.height,fw,fh); fclose(lg); } }
+                      if (lg) { fprintf(lg,"INJECT_SNAP %ux%u acc=0x%x snap=%ux%u source=%s\n",
+                          _d.width,_d.height,_d.access,fw,fh,
+                          fresh_rt_snap ? "rt" : "held"); fclose(lg); } }
                 }
+            }
             }
 
             if (_d.width == 192 && _d.height == 108)
             {
                 /* Tell device.c to pause auto-capture: save screen is open. */
-                wukiyo_save_screen_cooldown = 180; /* ~3s at 60fps; paused while screen open, resumes 3s after close */
+                wukiyo_save_screen_cooldown = 1800; /* ~30s at 60fps; keep the pre-save gameplay snap */
 
                 /* The old per-slot preview injection counted 192x108 LockRect calls
                  * and mapped them to save slots.  CMVS does not render slots in a

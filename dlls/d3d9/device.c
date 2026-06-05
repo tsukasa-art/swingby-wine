@@ -26,12 +26,19 @@ WINE_DEFAULT_DEBUG_CHANNEL(d3d9);
 
 static void STDMETHODCALLTYPE d3d9_null_wined3d_object_destroyed(void *parent) {}
 
-/* Set to ~120 by surface.c whenever a 192x108 LockRect fires (save screen open).
- * Decremented each Present; auto-capture is paused while this is non-zero. */
+/* Set by d3d9 hooks whenever a 192x108 save preview surface is touched
+ * (save screen open).  Decremented each Present; auto-capture is paused while
+ * this is non-zero so /tmp/wukiyo_snap.bgra keeps the pre-save gameplay frame. */
 UINT wukiyo_save_screen_cooldown = 0;
 
+/* Updated whenever /tmp/wukiyo_snap.bgra is written, regardless of capture path.
+ * Surface LockRect injection can use this as a fallback when CMVS reads a
+ * capture surface without a fresh GetRenderTargetData snap first. */
+DWORD wukiyo_snap_tick = 0;
+
 /* Updated only by the GetRenderTargetData render-target capture path.  Surface
- * LockRect injection uses this to reject stale frontbuffer / manual snaps. */
+ * LockRect injection prefers this when it is available because it represents
+ * the exact RT CMVS is about to encode. */
 DWORD wukiyo_rt_snap_tick = 0;
 
 /* Set while wukiyo_capture_rt_to_snap() locks its private sysmem surface. */
@@ -2087,6 +2094,7 @@ static HRESULT WINAPI d3d9_device_StretchRect(IDirect3DDevice9Ex *iface, IDirect
      * is handled by GetRenderTargetData -> full-resolution LockRect injection. */
     if (dst_desc.width == 192 && dst_desc.height == 108)
     {
+        wukiyo_save_screen_cooldown = 1800; /* keep the last gameplay snap while the save screen is open */
         { FILE *lg = fopen("Z:\\tmp\\wukiyo_stretch.txt","a");
           if (lg) { fprintf(lg,"stretch192 ignored src=%ux%u\n",
               src_desc.width,src_desc.height); fclose(lg); } }
@@ -2266,6 +2274,7 @@ static void wukiyo_capture_rt_to_snap(IDirect3DDevice9Ex *iface,
                 for (row = 0; row < sd.Height; row++)
                     fwrite((char*)lr.pBits + (size_t)row * lr.Pitch, sd.Width * 4, 1, f);
                 fclose(f);
+                wukiyo_snap_tick = now;
                 wukiyo_rt_snap_tick = now;
                 { FILE *lg = fopen("Z:\\tmp\\wukiyo_lock.txt","a");
                   if (lg) { fprintf(lg,"RT_TO_SNAP ok %ux%u\n",sd.Width,sd.Height); fclose(lg); } }
@@ -2345,6 +2354,7 @@ static void wukiyo_capture_frontbuffer(IDirect3DDevice9Ex *iface, struct d3d9_de
             for (row = 0; row < desc.Height; row++)
                 fwrite((char *)lr.pBits + (size_t)row * lr.Pitch, desc.Width * 4, 1, f);
             fclose(f);
+            wukiyo_snap_tick = GetTickCount();
             if (is_trigger) { f = fopen(snap_ready, "wb"); if (f) fclose(f); }
         }
         IDirect3DSurface9_UnlockRect(sys);
