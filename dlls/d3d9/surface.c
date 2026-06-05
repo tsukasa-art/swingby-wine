@@ -743,8 +743,14 @@ static unsigned int       s_unlock_pitch     = 0;
 static int                s_unlock_slot      = -1;
 static IDirect3DSurface9 *s_shadow_lock_iface = NULL;
 static IDirect3DSurface9 *s_shadow_lock_surface = NULL;
+static BYTE              *s_last_good_frame = NULL;
+static unsigned int       s_last_good_width = 0;
+static unsigned int       s_last_good_height = 0;
+static unsigned int       s_last_good_stride = 0;
+static DWORD              s_last_good_tick = 0;
+static unsigned long      s_last_good_avg = 0;
 
-static void wukiyo_log_lock_sample(const char *tag, IDirect3DSurface9 *iface,
+static unsigned long wukiyo_log_lock_sample(const char *tag, IDirect3DSurface9 *iface,
         const struct wined3d_sub_resource_desc *desc, const RECT *rect,
         DWORD flags, const struct wined3d_map_desc *map_desc)
 {
@@ -755,7 +761,7 @@ static void wukiyo_log_lock_sample(const char *tag, IDirect3DSurface9 *iface,
 
     if (!map_desc->data || !map_desc->row_pitch || desc->width < 16 || desc->height < 16
             || map_desc->row_pitch < desc->width * 4)
-        return;
+        return (unsigned long)-1;
 
     sample_w = desc->width < 192 ? desc->width : 192;
     sample_h = desc->height < 108 ? desc->height : 108;
@@ -789,6 +795,92 @@ static void wukiyo_log_lock_sample(const char *tag, IDirect3DSurface9 *iface,
                 min_y, max_y, count);
         fclose(lg);
     }
+
+    return count ? (unsigned long)(sum_y / count) : (unsigned long)-1;
+}
+
+static void wukiyo_remember_last_good_frame(const struct wined3d_sub_resource_desc *desc,
+        DWORD flags, const struct wined3d_map_desc *map_desc, unsigned long avg)
+{
+    SIZE_T row_bytes = (SIZE_T)desc->width * 4;
+    SIZE_T frame_bytes = row_bytes * desc->height;
+    unsigned int y;
+    BYTE *new_frame;
+    FILE *lg;
+
+    if (!(flags & D3DLOCK_READONLY) || wukiyo_rt_capture_active)
+        return;
+    if (desc->width != 1280 || desc->height != 720 || desc->access != 0xe || desc->bind_flags)
+        return;
+    if (avg == (unsigned long)-1 || avg < 16)
+        return;
+    if (!map_desc->data || map_desc->row_pitch < row_bytes)
+        return;
+
+    if (!s_last_good_frame || s_last_good_width != desc->width
+            || s_last_good_height != desc->height || s_last_good_stride != row_bytes)
+    {
+        if (s_last_good_frame)
+            new_frame = HeapReAlloc(GetProcessHeap(), 0, s_last_good_frame, frame_bytes);
+        else
+            new_frame = HeapAlloc(GetProcessHeap(), 0, frame_bytes);
+        if (!new_frame)
+            return;
+        s_last_good_frame = new_frame;
+        s_last_good_width = desc->width;
+        s_last_good_height = desc->height;
+        s_last_good_stride = row_bytes;
+    }
+
+    for (y = 0; y < desc->height; y++)
+        memcpy(s_last_good_frame + (SIZE_T)y * s_last_good_stride,
+                (const BYTE *)map_desc->data + (SIZE_T)y * map_desc->row_pitch, row_bytes);
+
+    s_last_good_tick = GetTickCount();
+    s_last_good_avg = avg;
+
+    lg = fopen("Z:\\tmp\\wukiyo_lock_detail.txt", "a");
+    if (lg)
+    {
+        fprintf(lg, "LAST_GOOD_FRAME 1280x720 avg=%lu tick=%lu\n",
+                s_last_good_avg, (unsigned long)s_last_good_tick);
+        fclose(lg);
+    }
+}
+
+static BOOL wukiyo_fill_shadow_from_last_good(IDirect3DSurface9 *iface,
+        const struct wined3d_sub_resource_desc *desc, const RECT *rect,
+        DWORD flags, const struct wined3d_map_desc *map_desc, unsigned long avg)
+{
+    DWORD now = GetTickCount();
+    SIZE_T row_bytes = (SIZE_T)desc->width * 4;
+    unsigned int y;
+    FILE *lg;
+
+    if (avg == (unsigned long)-1 || avg > 4)
+        return FALSE;
+    if (!s_last_good_frame || !s_last_good_tick || (DWORD)(now - s_last_good_tick) > 5000)
+        return FALSE;
+    if (desc->width != s_last_good_width || desc->height != s_last_good_height
+            || row_bytes != s_last_good_stride)
+        return FALSE;
+    if (!map_desc->data || map_desc->row_pitch < row_bytes)
+        return FALSE;
+
+    for (y = 0; y < desc->height; y++)
+        memcpy((BYTE *)map_desc->data + (SIZE_T)y * map_desc->row_pitch,
+                s_last_good_frame + (SIZE_T)y * s_last_good_stride, row_bytes);
+
+    lg = fopen("Z:\\tmp\\wukiyo_lock_detail.txt", "a");
+    if (lg)
+    {
+        fprintf(lg,
+                "LOCK_SHADOW_FILL_LAST_GOOD surf=%p rect=%s flags=0x%lx age=%lu avg_before=%lu avg_cached=%lu\n",
+                (void *)iface, wine_dbgstr_rect(rect), (unsigned long)flags,
+                (unsigned long)(now - s_last_good_tick), avg, s_last_good_avg);
+        fclose(lg);
+    }
+    return TRUE;
 }
 
 static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
@@ -860,7 +952,9 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
                         wined3dmapflags_from_d3dmapflags(flags, 0));
                 if (SUCCEEDED(hr))
                 {
-                    wukiyo_log_lock_sample("LOCK_SHADOW_SAMPLE", iface, &desc, rect, flags, &map_desc);
+                    unsigned long avg = wukiyo_log_lock_sample("LOCK_SHADOW_SAMPLE", iface, &desc, rect, flags, &map_desc);
+                    if (wukiyo_fill_shadow_from_last_good(iface, &desc, rect, flags, &map_desc, avg))
+                        wukiyo_log_lock_sample("LOCK_SHADOW_SAMPLE_AFTER_FILL", iface, &desc, rect, flags, &map_desc);
                     locked_rect->Pitch = map_desc.row_pitch;
                     locked_rect->pBits = map_desc.data;
                     s_shadow_lock_iface = iface;
@@ -976,7 +1070,8 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
             if ((desc.width == 192 && desc.height == 108)
                     || ((flags & D3DLOCK_READONLY) && desc.width >= 640 && desc.height >= 400))
             {
-                wukiyo_log_lock_sample("LOCK_SAMPLE", iface, &desc, rect, flags, &map_desc);
+                unsigned long avg = wukiyo_log_lock_sample("LOCK_SAMPLE", iface, &desc, rect, flags, &map_desc);
+                wukiyo_remember_last_good_frame(&desc, flags, &map_desc, avg);
             }
         }
     }
