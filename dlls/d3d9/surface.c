@@ -744,6 +744,53 @@ static int                s_unlock_slot      = -1;
 static IDirect3DSurface9 *s_shadow_lock_iface = NULL;
 static IDirect3DSurface9 *s_shadow_lock_surface = NULL;
 
+static void wukiyo_log_lock_sample(const char *tag, IDirect3DSurface9 *iface,
+        const struct wined3d_sub_resource_desc *desc, const RECT *rect,
+        DWORD flags, const struct wined3d_map_desc *map_desc)
+{
+    unsigned int sample_w, sample_h, step_x, step_y, x, y, count = 0;
+    unsigned int min_y = 255, max_y = 0;
+    UINT64 sum_y = 0;
+    FILE *lg;
+
+    if (!map_desc->data || !map_desc->row_pitch || desc->width < 16 || desc->height < 16
+            || map_desc->row_pitch < desc->width * 4)
+        return;
+
+    sample_w = desc->width < 192 ? desc->width : 192;
+    sample_h = desc->height < 108 ? desc->height : 108;
+    step_x = sample_w / 16;
+    step_y = sample_h / 12;
+    if (!step_x) step_x = 1;
+    if (!step_y) step_y = 1;
+
+    for (y = 0; y < sample_h; y += step_y)
+    {
+        const BYTE *row = (const BYTE *)map_desc->data + (SIZE_T)y * map_desc->row_pitch;
+        for (x = 0; x < sample_w; x += step_x)
+        {
+            const BYTE *p = row + x * 4;
+            unsigned int lum = ((unsigned int)p[0] + p[1] + p[2]) / 3;
+            if (lum < min_y) min_y = lum;
+            if (lum > max_y) max_y = lum;
+            sum_y += lum;
+            count++;
+        }
+    }
+
+    lg = fopen("Z:\\tmp\\wukiyo_lock_detail.txt", "a");
+    if (lg)
+    {
+        fprintf(lg,
+                "%s surf=%p %ux%u rect=%s flags=0x%lx acc=0x%x bind=0x%x fmt=0x%x pitch=%u avg=%lu min=%u max=%u samples=%u\n",
+                tag, (void *)iface, desc->width, desc->height, wine_dbgstr_rect(rect),
+                (unsigned long)flags, desc->access, desc->bind_flags, desc->format,
+                map_desc->row_pitch, count ? (unsigned long)(sum_y / count) : 0,
+                min_y, max_y, count);
+        fclose(lg);
+    }
+}
+
 static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
         D3DLOCKED_RECT *locked_rect, const RECT *rect, DWORD flags)
 {
@@ -813,6 +860,7 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
                         wined3dmapflags_from_d3dmapflags(flags, 0));
                 if (SUCCEEDED(hr))
                 {
+                    wukiyo_log_lock_sample("LOCK_SHADOW_SAMPLE", iface, &desc, rect, flags, &map_desc);
                     locked_rect->Pitch = map_desc.row_pitch;
                     locked_rect->pBits = map_desc.data;
                     s_shadow_lock_iface = iface;
@@ -923,6 +971,12 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
                  * thumbnails between slots.  Leave preview surfaces untouched and
                  * rely on the saved .dat thumbnail produced by the full-resolution
                  * capture path above. */
+            }
+
+            if ((desc.width == 192 && desc.height == 108)
+                    || ((flags & D3DLOCK_READONLY) && desc.width >= 640 && desc.height >= 400))
+            {
+                wukiyo_log_lock_sample("LOCK_SAMPLE", iface, &desc, rect, flags, &map_desc);
             }
         }
     }
