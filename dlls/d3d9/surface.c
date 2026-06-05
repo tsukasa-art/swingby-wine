@@ -772,7 +772,6 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
             && !s_shadow_lock_surface
             && desc.access == (WINED3D_RESOURCE_ACCESS_GPU
                     | WINED3D_RESOURCE_ACCESS_MAP_R | WINED3D_RESOURCE_ACCESS_MAP_W)
-            && (desc.bind_flags & WINED3D_BIND_RENDER_TARGET)
             && desc.width >= 640 && desc.height >= 400)
     {
         IDirect3DSurface9 *shadow = NULL;
