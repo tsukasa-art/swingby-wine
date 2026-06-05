@@ -779,10 +779,23 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
         struct d3d9_device *device = CONTAINING_RECORD(surface->parent_device,
                 struct d3d9_device, IDirect3DDevice9Ex_iface);
         RECT full_rect;
+        D3DFORMAT d3d_format = d3dformat_from_wined3dformat(desc.format);
 
-        if (SUCCEEDED(IDirect3DDevice9Ex_CreateOffscreenPlainSurface(surface->parent_device,
-                desc.width, desc.height, d3dformat_from_wined3dformat(desc.format),
-                D3DPOOL_SYSTEMMEM, &shadow, NULL)))
+        {
+            FILE *lg = fopen("Z:\\tmp\\wukiyo_lock.txt","a");
+            if (lg)
+            {
+                fprintf(lg,
+                        "LOCK_SHADOW_CANDIDATE src=%p %ux%u flags=0x%lx acc=0x%x bind=0x%x fmt=0x%x d3dfmt=0x%x\n",
+                        (void *)iface, desc.width, desc.height, (unsigned long)flags,
+                        desc.access, desc.bind_flags, desc.format, d3d_format);
+                fclose(lg);
+            }
+        }
+
+        hr = IDirect3DDevice9Ex_CreateOffscreenPlainSurface(surface->parent_device,
+                desc.width, desc.height, d3d_format, D3DPOOL_SYSTEMMEM, &shadow, NULL);
+        if (SUCCEEDED(hr))
         {
             shadow_impl = unsafe_impl_from_IDirect3DSurface9(shadow);
             SetRect(&full_rect, 0, 0, desc.width, desc.height);
@@ -833,6 +846,18 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
                 }
             }
             IDirect3DSurface9_Release(shadow);
+        }
+        else
+        {
+            FILE *lg = fopen("Z:\\tmp\\wukiyo_lock.txt","a");
+            if (lg)
+            {
+                fprintf(lg,
+                        "LOCK_SHADOW_CREATE_FAIL src=%p %ux%u flags=0x%lx acc=0x%x bind=0x%x fmt=0x%x d3dfmt=0x%x hr=0x%08lx\n",
+                        (void *)iface, desc.width, desc.height, (unsigned long)flags,
+                        desc.access, desc.bind_flags, desc.format, d3d_format, (unsigned long)hr);
+                fclose(lg);
+            }
         }
     }
 
