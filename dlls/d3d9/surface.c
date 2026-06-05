@@ -766,8 +766,7 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
      * directly instead of using GetRenderTargetData.  On the Metal-backed path,
      * mapping that GPU RT can return black.  For this read-only capture case,
      * copy the RT into a sysmem shadow first and hand CMVS the shadow map. */
-    if (!rect
-            && (flags & D3DLOCK_READONLY)
+    if ((flags & D3DLOCK_READONLY)
             && !wukiyo_rt_capture_active
             && !s_shadow_lock_surface
             && desc.access == (WINED3D_RESOURCE_ACCESS_GPU
@@ -786,9 +785,9 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
             if (lg)
             {
                 fprintf(lg,
-                        "LOCK_SHADOW_CANDIDATE src=%p %ux%u flags=0x%lx acc=0x%x bind=0x%x fmt=0x%x d3dfmt=0x%x\n",
-                        (void *)iface, desc.width, desc.height, (unsigned long)flags,
-                        desc.access, desc.bind_flags, desc.format, d3d_format);
+                        "LOCK_SHADOW_CANDIDATE src=%p %ux%u rect=%s flags=0x%lx acc=0x%x bind=0x%x fmt=0x%x d3dfmt=0x%x\n",
+                        (void *)iface, desc.width, desc.height, wine_dbgstr_rect(rect),
+                        (unsigned long)flags, desc.access, desc.bind_flags, desc.format, d3d_format);
                 fclose(lg);
             }
         }
@@ -810,7 +809,7 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
             if (SUCCEEDED(hr))
             {
                 hr = wined3d_resource_map(wined3d_texture_get_resource(shadow_impl->wined3d_texture),
-                        shadow_impl->sub_resource_idx, &map_desc, NULL,
+                        shadow_impl->sub_resource_idx, &map_desc, rect ? &box : NULL,
                         wined3dmapflags_from_d3dmapflags(flags, 0));
                 if (SUCCEEDED(hr))
                 {
@@ -823,9 +822,9 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
                         if (lg)
                         {
                             fprintf(lg,
-                                    "LOCK_SHADOW_RT src=%p shadow=%p %ux%u flags=0x%lx acc=0x%x bind=0x%x pitch=%u\n",
+                                    "LOCK_SHADOW_RT src=%p shadow=%p %ux%u rect=%s flags=0x%lx acc=0x%x bind=0x%x pitch=%u\n",
                                     (void *)iface, (void *)shadow, desc.width, desc.height,
-                                    (unsigned long)flags, desc.access, desc.bind_flags,
+                                    wine_dbgstr_rect(rect), (unsigned long)flags, desc.access, desc.bind_flags,
                                     map_desc.row_pitch);
                             fclose(lg);
                         }
@@ -839,9 +838,9 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
                 if (lg)
                 {
                     fprintf(lg,
-                            "LOCK_SHADOW_RT_FAIL src=%p %ux%u flags=0x%lx hr=0x%08lx\n",
+                            "LOCK_SHADOW_RT_FAIL src=%p %ux%u rect=%s flags=0x%lx hr=0x%08lx\n",
                             (void *)iface, desc.width, desc.height,
-                            (unsigned long)flags, (unsigned long)hr);
+                            wine_dbgstr_rect(rect), (unsigned long)flags, (unsigned long)hr);
                     fclose(lg);
                 }
             }
@@ -853,9 +852,9 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
             if (lg)
             {
                 fprintf(lg,
-                        "LOCK_SHADOW_CREATE_FAIL src=%p %ux%u flags=0x%lx acc=0x%x bind=0x%x fmt=0x%x d3dfmt=0x%x hr=0x%08lx\n",
-                        (void *)iface, desc.width, desc.height, (unsigned long)flags,
-                        desc.access, desc.bind_flags, desc.format, d3d_format, (unsigned long)hr);
+                        "LOCK_SHADOW_CREATE_FAIL src=%p %ux%u rect=%s flags=0x%lx acc=0x%x bind=0x%x fmt=0x%x d3dfmt=0x%x hr=0x%08lx\n",
+                        (void *)iface, desc.width, desc.height, wine_dbgstr_rect(rect),
+                        (unsigned long)flags, desc.access, desc.bind_flags, desc.format, d3d_format, (unsigned long)hr);
                 fclose(lg);
             }
         }
