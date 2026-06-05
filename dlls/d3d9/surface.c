@@ -377,6 +377,11 @@ static void wukiyo_blit(void *dst_data, unsigned int dst_pitch,
 /* Surface pointer set by StretchRect; cleared after one-shot injection. */
 static IDirect3DSurface9 *s_inject_pending_surf = NULL;
 static DWORD               s_inject_pending_tick = 0;
+static IDirect3DSurface9 *s_rtdata_dst_surf = NULL;
+static IDirect3DSurface9 *s_rtdata_src_surf = NULL;
+static DWORD               s_rtdata_tick = 0;
+static unsigned int        s_rtdata_serial = 0;
+static BOOL                s_rtdata_lock_logged = FALSE;
 
 /* Called from device.c on every StretchRect to a 192x108 destination. */
 void wukiyo_on_stretchrect(IDirect3DSurface9 *dest)
@@ -388,13 +393,19 @@ void wukiyo_on_stretchrect(IDirect3DSurface9 *dest)
       if (lg) { fprintf(lg,"stretchrect dest=%p\n",(void*)dest); fclose(lg); } }
 }
 
-/* Called from device.c when GetRenderTargetData is called for a 192x108 dst surface. */
+/* Called from device.c after GetRenderTargetData has copied render_target -> dst. */
 void wukiyo_on_get_render_target_data(IDirect3DSurface9 *src, IDirect3DSurface9 *dst)
 {
     s_inject_pending_surf = dst;
     s_inject_pending_tick = GetTickCount();
+    s_rtdata_src_surf = src;
+    s_rtdata_dst_surf = dst;
+    s_rtdata_tick = s_inject_pending_tick;
+    s_rtdata_serial++;
+    s_rtdata_lock_logged = FALSE;
     { FILE *lg = fopen("Z:\\tmp\\wukiyo_trace.txt","a");
-      if (lg) { fprintf(lg,"getrtdata_set pending=dst=%p\n",(void*)dst); fclose(lg); } }
+      if (lg) { fprintf(lg,"getrtdata_set serial=%u src=%p dst=%p\n",
+          s_rtdata_serial,(void*)src,(void*)dst); fclose(lg); } }
 }
 
 /* Inject the per-slot snap (wukiyo_snap_NNN.bgra) into the locked surface buffer.
@@ -759,55 +770,44 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
             wined3d_texture_get_sub_resource_desc(surface->wined3d_texture,
                 surface->sub_resource_idx, &_d);
             { static DWORD s_lr_throttle = 0; DWORD _now = GetTickCount();
-              if ((_d.width != 192 || _d.height != 108) && (DWORD)(_now - s_lr_throttle) > 200) {
+              if (!wukiyo_rt_capture_active
+                  && (_d.width != 192 || _d.height != 108) && (DWORD)(_now - s_lr_throttle) > 200) {
                 FILE *lg2 = fopen("Z:\\tmp\\wukiyo_lock.txt","a");
                 if (lg2) { fprintf(lg2,"LockRect %ux%u flags=0x%lx acc=0x%x\n",
                     _d.width,_d.height,(unsigned long)flags,_d.access); fclose(lg2); s_lr_throttle=_now; } } }
 
-            /* Intercept screenshot capture: CMVS locks a full-resolution readback
-             * surface to encode the save thumbnail.  Recent traces show both
-             * acc=0xd and acc=0xe depending on the path.  Prefer a fresh RT snap
-             * when GetRenderTargetData fired; otherwise, while the save screen is
-             * open, fall back to the last pre-save gameplay snap kept by device.c. */
+            /* CMVS locks the full-resolution GetRenderTargetData destination
+             * surface to encode the save thumbnail.  Do not overwrite it from an
+             * external snap here; Windows semantics are established by the direct
+             * render_target -> dst_surface copy in device.c.  This log ties the
+             * LockRect back to the exact GetRenderTargetData destination. */
             {
-                DWORD inject_now = GetTickCount();
-                BOOL fresh_rt_snap = wukiyo_rt_snap_tick
-                    && (DWORD)(inject_now - wukiyo_rt_snap_tick) < 2000;
-                BOOL fresh_saved_snap = wukiyo_snap_tick
-                    && wukiyo_save_screen_cooldown > 0
-                    && (DWORD)(inject_now - wukiyo_snap_tick) < 60000;
+                DWORD lock_now = GetTickCount();
                 BOOL capture_access = (_d.access == 0xd) || (_d.access == 0xe);
 
-            if ((flags & 0x10) /* D3DLOCK_READONLY */
-                && !wukiyo_rt_capture_active
-                && capture_access
-                && (_d.width >= 640) && (_d.height >= 400)
-                && (fresh_rt_snap || fresh_saved_snap))
-            {
-                BYTE *px = NULL; unsigned int fw, fh, fs;
-                if (wukiyo_load_snap_uncached("Z:\\tmp\\wukiyo_snap.bgra", &px, &fw, &fh, &fs))
+                if ((flags & 0x10) /* D3DLOCK_READONLY */
+                    && !wukiyo_rt_capture_active
+                    && capture_access
+                    && (_d.width >= 640) && (_d.height >= 400))
                 {
-                    /* Scale snap → surface dimensions (usually 1:1, snap is same res). */
-                    unsigned int dy, dx;
-                    for (dy = 0; dy < _d.height; dy++) {
-                        unsigned int sy = (unsigned int)((UINT64)dy * fh / _d.height);
-                        const BYTE *src = px + (SIZE_T)sy * fs;
-                        BYTE *dst = (BYTE *)map_desc.data + (SIZE_T)dy * map_desc.row_pitch;
-                        for (dx = 0; dx < _d.width; dx++) {
-                            unsigned int sx = (unsigned int)((UINT64)dx * fw / _d.width);
-                            dst[dx*4+0] = src[sx*4+0];
-                            dst[dx*4+1] = src[sx*4+1];
-                            dst[dx*4+2] = src[sx*4+2];
-                            dst[dx*4+3] = 0xFF;
+                    BOOL matched = iface == s_rtdata_dst_surf
+                        && s_rtdata_tick
+                        && (DWORD)(lock_now - s_rtdata_tick) < 5000;
+                    if (matched && !s_rtdata_lock_logged)
+                    {
+                        FILE *lg = fopen("Z:\\tmp\\wukiyo_lock.txt","a");
+                        if (lg)
+                        {
+                            fprintf(lg,
+                                "LOCK_RTDATA_MATCH serial=%u src=%p dst=%p %ux%u flags=0x%lx acc=0x%x pitch=%u age=%lu\n",
+                                s_rtdata_serial,(void*)s_rtdata_src_surf,(void*)iface,
+                                _d.width,_d.height,(unsigned long)flags,_d.access,
+                                map_desc.row_pitch,(unsigned long)(lock_now - s_rtdata_tick));
+                            fclose(lg);
                         }
+                        s_rtdata_lock_logged = TRUE;
                     }
-                    HeapFree(GetProcessHeap(), 0, px);
-                    { FILE *lg = fopen("Z:\\tmp\\wukiyo_lock.txt","a");
-                      if (lg) { fprintf(lg,"INJECT_SNAP %ux%u acc=0x%x snap=%ux%u source=%s\n",
-                          _d.width,_d.height,_d.access,fw,fh,
-                          fresh_rt_snap ? "rt" : "held"); fclose(lg); } }
                 }
-            }
             }
 
             if (_d.width == 192 && _d.height == 108)

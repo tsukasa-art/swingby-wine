@@ -41,7 +41,7 @@ DWORD wukiyo_snap_tick = 0;
  * the exact RT CMVS is about to encode. */
 DWORD wukiyo_rt_snap_tick = 0;
 
-/* Set while wukiyo_capture_rt_to_snap() locks its private sysmem surface. */
+/* Set while Wukiyo's private capture helpers lock their sysmem surfaces. */
 BOOL wukiyo_rt_capture_active = FALSE;
 
 const struct wined3d_parent_ops d3d9_null_wined3d_parent_ops =
@@ -1891,10 +1891,11 @@ static HRESULT WINAPI d3d9_device_GetRenderTargetData(IDirect3DDevice9Ex *iface,
     struct d3d9_device *device = impl_from_IDirect3DDevice9Ex(iface);
     struct d3d9_surface *rt_impl = unsafe_impl_from_IDirect3DSurface9(render_target);
     struct d3d9_surface *dst_impl = unsafe_impl_from_IDirect3DSurface9(dst_surface);
-    struct wined3d_sub_resource_desc wined3d_desc;
+    struct wined3d_sub_resource_desc rt_desc, dst_desc;
     RECT dst_rect, src_rect;
     HRESULT hr;
     BOOL dst_is_192x108;
+    BOOL dst_is_cmvs_readback;
 
     TRACE("iface %p, render_target %p, dst_surface %p.\n", iface, render_target, dst_surface);
 
@@ -1903,54 +1904,74 @@ static HRESULT WINAPI d3d9_device_GetRenderTargetData(IDirect3DDevice9Ex *iface,
 
     wined3d_mutex_lock();
 
-    /* Wukiyo: check thumbnail size before any early return. */
-    wined3d_texture_get_sub_resource_desc(dst_impl->wined3d_texture, dst_impl->sub_resource_idx, &wined3d_desc);
-    dst_is_192x108 = (wined3d_desc.width == 192 && wined3d_desc.height == 108);
+    wined3d_texture_get_sub_resource_desc(dst_impl->wined3d_texture, dst_impl->sub_resource_idx, &dst_desc);
+    wined3d_texture_get_sub_resource_desc(rt_impl->wined3d_texture, rt_impl->sub_resource_idx, &rt_desc);
+    dst_is_192x108 = (dst_desc.width == 192 && dst_desc.height == 108);
+    dst_is_cmvs_readback = (dst_desc.width >= 640 && dst_desc.height >= 400
+            && (dst_desc.access & WINED3D_RESOURCE_ACCESS_CPU)
+            && (dst_desc.access & WINED3D_RESOURCE_ACCESS_MAP_R));
 
-    /* CG compositor path (restored for all surfaces — removing it caused startup crash
-     * because wined3d_device_context_blt is not safe during device initialization). */
-    if (device->implicit_swapchain_count > 0)
-    {
-        hr = wined3d_swapchain_get_front_buffer_data(device->implicit_swapchains[0],
-                dst_impl->wined3d_texture, dst_impl->sub_resource_idx);
-        if (SUCCEEDED(hr))
-        {
-            wined3d_mutex_unlock();
-            if (!dst_is_192x108)
-                /* Capture fresh snap from the exact RT CMVS is about to thumbnail. */
-                wukiyo_capture_rt_to_snap(iface, device, rt_impl);
-            else
-            { extern void wukiyo_on_get_render_target_data(IDirect3DSurface9 *s, IDirect3DSurface9 *d);
-              wukiyo_on_get_render_target_data(render_target, dst_surface); }
-            return hr;
-        }
-    }
-
-    wined3d_texture_get_sub_resource_desc(dst_impl->wined3d_texture, dst_impl->sub_resource_idx, &wined3d_desc);
-    SetRect(&dst_rect, 0, 0, wined3d_desc.width, wined3d_desc.height);
-
-    wined3d_texture_get_sub_resource_desc(rt_impl->wined3d_texture, rt_impl->sub_resource_idx, &wined3d_desc);
-    SetRect(&src_rect, 0, 0, wined3d_desc.width, wined3d_desc.height);
+    SetRect(&dst_rect, 0, 0, dst_desc.width, dst_desc.height);
+    SetRect(&src_rect, 0, 0, rt_desc.width, rt_desc.height);
 
     /* TODO: Check surface sizes, pools, etc. */
-    if (wined3d_desc.multisample_type)
+    if (rt_desc.multisample_type)
         hr = D3DERR_INVALIDCALL;
     else
         hr = wined3d_device_context_blt(device->immediate_context,
                 dst_impl->wined3d_texture, dst_impl->sub_resource_idx, &dst_rect,
                 rt_impl->wined3d_texture, rt_impl->sub_resource_idx, &src_rect, 0, NULL, WINED3D_TEXF_POINT);
     wined3d_mutex_unlock();
-    if (SUCCEEDED(hr))
+
     {
-        if (!dst_is_192x108)
-            /* Capture fresh snap from the exact RT CMVS is about to thumbnail. */
-            wukiyo_capture_rt_to_snap(iface, device, rt_impl);
-        else
+        FILE *lg = fopen("Z:\\tmp\\wukiyo_trace.txt", "a");
+        if (lg)
         {
-            extern void wukiyo_on_get_render_target_data(IDirect3DSurface9 *s, IDirect3DSurface9 *d);
-            wukiyo_on_get_render_target_data(render_target, dst_surface);
+            fprintf(lg,
+                    "GetRTData direct hr=0x%08lx src=%p %ux%u fmt=0x%x acc=0x%x bind=0x%x dst=%p %ux%u fmt=0x%x acc=0x%x bind=0x%x%s\n",
+                    (unsigned long)hr, (void *)render_target, rt_desc.width, rt_desc.height,
+                    rt_desc.format, rt_desc.access, rt_desc.bind_flags, (void *)dst_surface,
+                    dst_desc.width, dst_desc.height, dst_desc.format, dst_desc.access,
+                    dst_desc.bind_flags, dst_is_cmvs_readback ? " cmvs-readback" : "");
+            fclose(lg);
         }
     }
+
+    if (SUCCEEDED(hr))
+    {
+        extern void wukiyo_on_get_render_target_data(IDirect3DSurface9 *s, IDirect3DSurface9 *d);
+        wukiyo_on_get_render_target_data(render_target, dst_surface);
+
+        if (!dst_is_192x108)
+            /* Support Wukiyo's later persistence patch with the same RT pixels.
+             * The live preview path itself is the direct RT -> dst_surface copy above. */
+            wukiyo_capture_rt_to_snap(iface, device, rt_impl);
+        return hr;
+    }
+
+    if (dst_is_cmvs_readback)
+        return hr;
+
+    /* Non-CMVS fallback only.  CMVS save thumbnails need Windows semantics:
+     * render_target -> dst_surface, not macOS compositor/front-buffer pixels. */
+    if (device->implicit_swapchain_count > 0)
+    {
+        wined3d_mutex_lock();
+        hr = wined3d_swapchain_get_front_buffer_data(device->implicit_swapchains[0],
+                dst_impl->wined3d_texture, dst_impl->sub_resource_idx);
+        wined3d_mutex_unlock();
+        if (SUCCEEDED(hr))
+        {
+            FILE *lg = fopen("Z:\\tmp\\wukiyo_trace.txt", "a");
+            if (lg)
+            {
+                fprintf(lg, "GetRTData fallback-frontbuffer dst=%p %ux%u\n",
+                        (void *)dst_surface, dst_desc.width, dst_desc.height);
+                fclose(lg);
+            }
+        }
+    }
+
     return hr;
 }
 
@@ -2342,6 +2363,7 @@ static void wukiyo_capture_frontbuffer(IDirect3DDevice9Ex *iface, struct d3d9_de
     IDirect3DSurface9_Release(bb);
     if (FAILED(hr)) { IDirect3DSurface9_Release(sys); return; }
 
+    wukiyo_rt_capture_active = TRUE;
     if (SUCCEEDED(IDirect3DSurface9_LockRect(sys, &lr, NULL, D3DLOCK_READONLY)))
     {
         f = fopen(snap_out, "wb");
@@ -2359,6 +2381,7 @@ static void wukiyo_capture_frontbuffer(IDirect3DDevice9Ex *iface, struct d3d9_de
         }
         IDirect3DSurface9_UnlockRect(sys);
     }
+    wukiyo_rt_capture_active = FALSE;
     IDirect3DSurface9_Release(sys);
 }
 
