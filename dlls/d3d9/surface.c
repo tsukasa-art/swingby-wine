@@ -808,7 +808,7 @@ static void wukiyo_remember_last_good_frame(const struct wined3d_sub_resource_de
     BYTE *new_frame;
     FILE *lg;
 
-    if (!(flags & D3DLOCK_READONLY) || wukiyo_rt_capture_active)
+    if (!(flags & D3DLOCK_READONLY))
         return;
     if (desc->width != 1280 || desc->height != 720 || desc->access != 0xe || desc->bind_flags)
         return;
@@ -842,8 +842,8 @@ static void wukiyo_remember_last_good_frame(const struct wined3d_sub_resource_de
     lg = fopen("Z:\\tmp\\wukiyo_lock_detail.txt", "a");
     if (lg)
     {
-        fprintf(lg, "LAST_GOOD_FRAME 1280x720 avg=%lu tick=%lu\n",
-                s_last_good_avg, (unsigned long)s_last_good_tick);
+        fprintf(lg, "LAST_GOOD_FRAME 1280x720 avg=%lu tick=%lu active=%u\n",
+                s_last_good_avg, (unsigned long)s_last_good_tick, wukiyo_rt_capture_active);
         fclose(lg);
     }
 }
@@ -860,10 +860,32 @@ static BOOL wukiyo_fill_shadow_from_last_good(IDirect3DSurface9 *iface,
     if (avg == (unsigned long)-1 || avg > 4)
         return FALSE;
     if (!s_last_good_frame || !s_last_good_tick || (DWORD)(now - s_last_good_tick) > 5000)
+    {
+        lg = fopen("Z:\\tmp\\wukiyo_lock_detail.txt", "a");
+        if (lg)
+        {
+            fprintf(lg,
+                    "LOCK_SHADOW_FILL_SKIP no_recent_last_good surf=%p age=%lu has=%u tick=%lu avg_before=%lu\n",
+                    (void *)iface, s_last_good_tick ? (unsigned long)(now - s_last_good_tick) : 0,
+                    s_last_good_frame ? 1 : 0, (unsigned long)s_last_good_tick, avg);
+            fclose(lg);
+        }
         return FALSE;
+    }
     if (desc->width != s_last_good_width || desc->height != s_last_good_height
             || row_bytes != s_last_good_stride)
+    {
+        lg = fopen("Z:\\tmp\\wukiyo_lock_detail.txt", "a");
+        if (lg)
+        {
+            fprintf(lg,
+                    "LOCK_SHADOW_FILL_SKIP size_mismatch surf=%p shadow=%ux%u cached=%ux%u stride=%u/%u avg_before=%lu\n",
+                    (void *)iface, desc->width, desc->height, s_last_good_width, s_last_good_height,
+                    (unsigned int)row_bytes, s_last_good_stride, avg);
+            fclose(lg);
+        }
         return FALSE;
+    }
     if (!map_desc->data || map_desc->row_pitch < row_bytes)
         return FALSE;
 
