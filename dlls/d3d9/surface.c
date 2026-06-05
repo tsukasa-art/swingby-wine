@@ -250,6 +250,8 @@ static HRESULT WINAPI d3d9_surface_GetDesc(IDirect3DSurface9 *iface, D3DSURFACE_
 
 /* Shared with device.c: pauses auto-capture while save screen is open. */
 extern UINT wukiyo_save_screen_cooldown;
+extern DWORD wukiyo_rt_snap_tick;
+extern BOOL wukiyo_rt_capture_active;
 
 static void wukiyo_free_pix_cache(void); /* forward declaration */
 
@@ -766,8 +768,11 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
              * GetRenderTargetData fills it with black on Metal; inject our snap so
              * CMVS encodes the correct frame directly into .dat — no reopen needed. */
             if ((flags & 0x10) /* D3DLOCK_READONLY */
+                && !wukiyo_rt_capture_active
                 && (_d.access == 0xd)
-                && (_d.width >= 640) && (_d.height >= 400))
+                && (_d.width >= 640) && (_d.height >= 400)
+                && wukiyo_rt_snap_tick
+                && (DWORD)(GetTickCount() - wukiyo_rt_snap_tick) < 2000)
             {
                 BYTE *px = NULL; unsigned int fw, fh, fs;
                 if (wukiyo_load_snap_uncached("Z:\\tmp\\wukiyo_snap.bgra", &px, &fw, &fh, &fs))
@@ -795,63 +800,15 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
 
             if (_d.width == 192 && _d.height == 108)
             {
-                /* Save-path injection: game is about to READ this surface to encode .dat.
-                 * Inject wukiyo_snap.bgra NOW (before the game reads) so the correct
-                 * game frame ends up in the save file — no async Swift patching needed. */
-                if (iface == s_inject_pending_surf && s_inject_pending_tick != 0
-                    && (DWORD)(GetTickCount() - s_inject_pending_tick) < 2000)
-                {
-                    BYTE *px = NULL; unsigned int fw, fh, fs;
-                    if (wukiyo_load_snap_uncached("Z:\\tmp\\wukiyo_snap.bgra",
-                                                  &px, &fw, &fh, &fs))
-                    {
-                        wukiyo_blit(map_desc.data, map_desc.row_pitch, px, fw, fh, fs);
-                        HeapFree(GetProcessHeap(), 0, px);
-                        { FILE *lg = fopen("Z:\\tmp\\wukiyo_trace.txt","a");
-                          if (lg) { fprintf(lg,"lockrect_inject ok %ux%u\n",fw,fh); fclose(lg); } }
-                    }
-                    s_inject_pending_surf = NULL;
-                    s_inject_pending_tick = 0;
-                }
-
-                DWORD now = GetTickCount();
-                BOOL  new_seq = (s_192_last_tick == 0 || (DWORD)(now - s_192_last_tick) > 2000);
-                s_192_last_tick = now;
                 /* Tell device.c to pause auto-capture: save screen is open. */
                 wukiyo_save_screen_cooldown = 180; /* ~3s at 60fps; paused while screen open, resumes 3s after close */
 
-                if (new_seq)
-                {
-                    unsigned int pb = 0;
-                    FILE *pf = fopen("Z:\\tmp\\wukiyo_page_base.txt", "rb");
-                    if (!pf)
-                    {
-                        /* Fall back to persistent path if /tmp was cleared after reboot. */
-                        const char *home = getenv("HOME");
-                        if (home)
-                        {
-                            char pbpath[512];
-                            snprintf(pbpath, sizeof(pbpath), "%s/.wukiyo_snaps/page_base.txt", home);
-                            pf = fopen(pbpath, "rb");
-                        }
-                    }
-                    if (pf) { fscanf(pf, "%u", &pb); fclose(pf); }
-                    s_reg_page_base = pb;
-                    s_192_counter = 0;
-                    /* Reset inject_fired log on new sequence. */
-                    { FILE *lg = fopen("Z:\\tmp\\wukiyo_inject_fired.txt","w");
-                      if (lg) { fprintf(lg,"page_base=%u\n", pb); fclose(lg); } }
-                }
-
-                /* Schedule inject for every slot position within the page (first 18). */
-                if (s_192_counter < 18)
-                {
-                    s_unlock_iface = iface;
-                    s_unlock_data  = map_desc.data;
-                    s_unlock_pitch = map_desc.row_pitch;
-                    s_unlock_slot  = (int)(s_reg_page_base + s_192_counter);
-                }
-                s_192_counter++;
+                /* The old per-slot preview injection counted 192x108 LockRect calls
+                 * and mapped them to save slots.  CMVS does not render slots in a
+                 * stable enough order, so reopening the save screen could shift
+                 * thumbnails between slots.  Leave preview surfaces untouched and
+                 * rely on the saved .dat thumbnail produced by the full-resolution
+                 * capture path above. */
             }
         }
     }

@@ -30,6 +30,13 @@ static void STDMETHODCALLTYPE d3d9_null_wined3d_object_destroyed(void *parent) {
  * Decremented each Present; auto-capture is paused while this is non-zero. */
 UINT wukiyo_save_screen_cooldown = 0;
 
+/* Updated only by the GetRenderTargetData render-target capture path.  Surface
+ * LockRect injection uses this to reject stale frontbuffer / manual snaps. */
+DWORD wukiyo_rt_snap_tick = 0;
+
+/* Set while wukiyo_capture_rt_to_snap() locks its private sysmem surface. */
+BOOL wukiyo_rt_capture_active = FALSE;
+
 const struct wined3d_parent_ops d3d9_null_wined3d_parent_ops =
 {
     d3d9_null_wined3d_object_destroyed,
@@ -2073,55 +2080,16 @@ static HRESULT WINAPI d3d9_device_StretchRect(IDirect3DDevice9Ex *iface, IDirect
         }
     }
 
-    /* Wukiyo: for thumbnail captures (dst=192x108), capture the src surface at full
-     * resolution using the wined3d GPU→SYSMEM blit path (proven to work in
-     * wukiyo_capture_frontbuffer).  Write to wukiyo_snap.bgra and tag dst so that
-     * the subsequent LockRect can inject our pixels before the game encodes the .dat.
-     * The CG compositor path (get_front_buffer_data) returns black on Metal and is
-     * no longer used here. */
+    /* Wukiyo: do not write wukiyo_snap.bgra from 192x108 thumbnail preview
+     * StretchRect calls.  These calls render existing save thumbnails in the save
+     * UI; treating them as a fresh gameplay capture makes subsequent saves use an
+     * older thumbnail image instead of the scene that was just saved.  Persistence
+     * is handled by GetRenderTargetData -> full-resolution LockRect injection. */
     if (dst_desc.width == 192 && dst_desc.height == 108)
     {
-        IDirect3DSurface9 *sys_surf = NULL;
-        if (SUCCEEDED(d3d9_device_CreateOffscreenPlainSurface(iface,
-                src_desc.width, src_desc.height,
-                d3dformat_from_wined3dformat(src_desc.format),
-                D3DPOOL_SYSTEMMEM, &sys_surf, NULL)))
-        {
-            struct d3d9_surface *sys_impl = unsafe_impl_from_IDirect3DSurface9(sys_surf);
-            RECT blt_r;
-            HRESULT blt_hr;
-            SetRect(&blt_r, 0, 0, (int)src_desc.width, (int)src_desc.height);
-            blt_hr = wined3d_device_context_blt(device->immediate_context,
-                    sys_impl->wined3d_texture, sys_impl->sub_resource_idx, &blt_r,
-                    src->wined3d_texture, src->sub_resource_idx, &blt_r,
-                    0, NULL, WINED3D_TEXF_POINT);
-            if (SUCCEEDED(blt_hr))
-            {
-                D3DLOCKED_RECT lr;
-                if (SUCCEEDED(IDirect3DSurface9_LockRect(sys_surf, &lr, NULL, D3DLOCK_READONLY)))
-                {
-                    FILE *snap_f = fopen("Z:\\tmp\\wukiyo_snap.bgra", "wb");
-                    if (snap_f)
-                    {
-                        UINT32 fw = src_desc.width, fh = src_desc.height;
-                        UINT32 fs = (UINT32)lr.Pitch;
-                        UINT r;
-                        fwrite(&fw, 4, 1, snap_f); fwrite(&fh, 4, 1, snap_f);
-                        fwrite(&fs, 4, 1, snap_f);
-                        for (r = 0; r < fh; r++)
-                            fwrite((char*)lr.pBits + (size_t)r * lr.Pitch, fw * 4, 1, snap_f);
-                        fclose(snap_f);
-                    }
-                    IDirect3DSurface9_UnlockRect(sys_surf);
-                }
-            }
-            IDirect3DSurface9_Release(sys_surf);
-            { FILE *lg = fopen("Z:\\tmp\\wukiyo_stretch.txt","a");
-              if (lg) { fprintf(lg,"stretch192 snap_written blt_hr=0x%08x src=%ux%u\n",
-                  (unsigned)blt_hr,src_desc.width,src_desc.height); fclose(lg); } }
-        }
-        { extern void wukiyo_on_stretchrect(IDirect3DSurface9 *d);
-          wukiyo_on_stretchrect(dst_surface); }
+        { FILE *lg = fopen("Z:\\tmp\\wukiyo_stretch.txt","a");
+          if (lg) { fprintf(lg,"stretch192 ignored src=%ux%u\n",
+              src_desc.width,src_desc.height); fclose(lg); } }
     }
 
     hr = wined3d_device_context_blt(device->immediate_context, dst->wined3d_texture,
@@ -2257,7 +2225,6 @@ static void wukiyo_capture_rt_to_snap(IDirect3DDevice9Ex *iface,
     struct d3d9_device *device, struct d3d9_surface *src_impl)
 {
     static const char snap_out[] = "Z:\\tmp\\wukiyo_snap.bgra";
-    static DWORD s_last_rt_snap = 0;
     IDirect3DSurface9 *sys = NULL;
     struct d3d9_surface *sys_impl;
     D3DSURFACE_DESC sd;
@@ -2270,8 +2237,6 @@ static void wukiyo_capture_rt_to_snap(IDirect3DDevice9Ex *iface,
     if (!device->implicit_swapchain_count) return;
 
     now = GetTickCount();
-    if ((DWORD)(now - s_last_rt_snap) < 50) return;
-    s_last_rt_snap = now;
 
     if (FAILED(IDirect3DSurface9_GetDesc(&src_impl->IDirect3DSurface9_iface, &sd)))
         return;
@@ -2289,19 +2254,25 @@ static void wukiyo_capture_rt_to_snap(IDirect3DDevice9Ex *iface,
             0, NULL, WINED3D_TEXF_POINT);
     wined3d_mutex_unlock();
 
-    if (SUCCEEDED(hr) && SUCCEEDED(IDirect3DSurface9_LockRect(sys, &lr, NULL, D3DLOCK_READONLY)))
+    if (SUCCEEDED(hr))
     {
-        FILE *f = fopen(snap_out, "wb");
-        if (f) {
-            uint32_t w = sd.Width, h = sd.Height, s = (uint32_t)lr.Pitch;
-            fwrite(&w, 4, 1, f); fwrite(&h, 4, 1, f); fwrite(&s, 4, 1, f);
-            for (row = 0; row < sd.Height; row++)
-                fwrite((char*)lr.pBits + (size_t)row * lr.Pitch, sd.Width * 4, 1, f);
-            fclose(f);
-            { FILE *lg = fopen("Z:\\tmp\\wukiyo_lock.txt","a");
-              if (lg) { fprintf(lg,"RT_TO_SNAP ok %ux%u\n",sd.Width,sd.Height); fclose(lg); } }
+        wukiyo_rt_capture_active = TRUE;
+        if (SUCCEEDED(IDirect3DSurface9_LockRect(sys, &lr, NULL, D3DLOCK_READONLY)))
+        {
+            FILE *f = fopen(snap_out, "wb");
+            if (f) {
+                uint32_t w = sd.Width, h = sd.Height, s = (uint32_t)lr.Pitch;
+                fwrite(&w, 4, 1, f); fwrite(&h, 4, 1, f); fwrite(&s, 4, 1, f);
+                for (row = 0; row < sd.Height; row++)
+                    fwrite((char*)lr.pBits + (size_t)row * lr.Pitch, sd.Width * 4, 1, f);
+                fclose(f);
+                wukiyo_rt_snap_tick = now;
+                { FILE *lg = fopen("Z:\\tmp\\wukiyo_lock.txt","a");
+                  if (lg) { fprintf(lg,"RT_TO_SNAP ok %ux%u\n",sd.Width,sd.Height); fclose(lg); } }
+            }
+            IDirect3DSurface9_UnlockRect(sys);
         }
-        IDirect3DSurface9_UnlockRect(sys);
+        wukiyo_rt_capture_active = FALSE;
     }
     IDirect3DSurface9_Release(sys);
 }
