@@ -253,6 +253,8 @@ extern UINT wukiyo_save_screen_cooldown;
 extern DWORD wukiyo_snap_tick;
 extern DWORD wukiyo_rt_snap_tick;
 extern BOOL wukiyo_rt_capture_active;
+extern BOOL wukiyo_observe_only;
+extern void wukiyo_diag(const char *fmt, ...);
 
 static void wukiyo_free_pix_cache(void); /* forward declaration */
 
@@ -799,6 +801,105 @@ static unsigned long wukiyo_log_lock_sample(const char *tag, IDirect3DSurface9 *
     return count ? (unsigned long)(sum_y / count) : (unsigned long)-1;
 }
 
+/* Diag: read the surface's current GPU content through an independent
+ * blt -> sysmem path and report its luminance.  Distinguishes "content exists
+ * on the GPU but the CPU map is stale/black" from "the surface really has no
+ * content at lock time". */
+static void wukiyo_probe_gpu_content(IDirect3DSurface9 *iface, struct d3d9_surface *surface,
+        const struct wined3d_sub_resource_desc *desc)
+{
+    IDirect3DSurface9 *probe = NULL;
+    struct d3d9_surface *probe_impl;
+    struct wined3d_map_desc map_desc;
+    D3DFORMAT d3d_format = d3dformat_from_wined3dformat(desc->format);
+    RECT r;
+    HRESULT hr;
+
+    wukiyo_rt_capture_active = TRUE;
+
+    hr = IDirect3DDevice9Ex_CreateOffscreenPlainSurface(surface->parent_device,
+            desc->width, desc->height, d3d_format, D3DPOOL_SYSTEMMEM, &probe, NULL);
+    if (SUCCEEDED(hr))
+    {
+        struct d3d9_device *device = CONTAINING_RECORD(surface->parent_device,
+                struct d3d9_device, IDirect3DDevice9Ex_iface);
+        probe_impl = unsafe_impl_from_IDirect3DSurface9(probe);
+        SetRect(&r, 0, 0, desc->width, desc->height);
+
+        wined3d_mutex_lock();
+        hr = wined3d_device_context_blt(device->immediate_context,
+                probe_impl->wined3d_texture, probe_impl->sub_resource_idx, &r,
+                surface->wined3d_texture, surface->sub_resource_idx, &r,
+                0, NULL, WINED3D_TEXF_POINT);
+        wined3d_mutex_unlock();
+
+        if (SUCCEEDED(hr)
+                && SUCCEEDED(wined3d_resource_map(wined3d_texture_get_resource(probe_impl->wined3d_texture),
+                        probe_impl->sub_resource_idx, &map_desc, NULL, WINED3D_MAP_READ)))
+        {
+            unsigned long avg = wukiyo_log_lock_sample("DIAG_GPU_PROBE", iface, desc, NULL, 0, &map_desc);
+            wukiyo_diag("GPU_PROBE surf=%p %ux%u blt_avg=%lu",
+                    (void *)iface, desc->width, desc->height, avg);
+            wined3d_resource_unmap(wined3d_texture_get_resource(probe_impl->wined3d_texture),
+                    probe_impl->sub_resource_idx);
+        }
+        else
+            wukiyo_diag("GPU_PROBE surf=%p blt/map failed hr=0x%lx",
+                    (void *)iface, (unsigned long)hr);
+        IDirect3DSurface9_Release(probe);
+    }
+    else
+        wukiyo_diag("GPU_PROBE surf=%p create failed hr=0x%lx",
+                (void *)iface, (unsigned long)hr);
+
+    wukiyo_rt_capture_active = FALSE;
+}
+
+/* Diag: most recent full-resolution write lock, sampled again at UnlockRect to
+ * see what content the application itself wrote into the surface. */
+static IDirect3DSurface9 *s_diag_write_iface;
+static void *s_diag_write_data;
+static unsigned int s_diag_write_pitch;
+static struct wined3d_sub_resource_desc s_diag_write_desc;
+
+/* ---- Windows windowed-present copy semantics --------------------------
+ * On Windows, presenting in windowed mode leaves the presented frame in the
+ * back buffer.  CMVS captures save/load thumbnails with GetBackBuffer +
+ * LockRect(READONLY) at the moment the save/load screen opens, expecting
+ * that frame to still be there.  On the Metal-backed wined3d path the
+ * back-buffer content is gone after Present (the diag GPU probe reads black
+ * even through an independent blt).  Emulate the Windows semantics instead:
+ * device.c stores a copy of the back buffer at every Present, and the
+ * READONLY back-buffer lock serves that copy verbatim — no luminance
+ * heuristics, no freshness windows, no snap files. */
+static BYTE        *s_lastpres_frame;
+static unsigned int s_lastpres_w, s_lastpres_h, s_lastpres_stride;
+
+void wukiyo_store_last_presented(const void *data, unsigned int pitch,
+        unsigned int w, unsigned int h)
+{
+    SIZE_T row_bytes = (SIZE_T)w * 4;
+    unsigned int y;
+
+    if (!data || !w || !h || pitch < row_bytes)
+        return;
+    if (!s_lastpres_frame || s_lastpres_w != w || s_lastpres_h != h)
+    {
+        BYTE *nf = s_lastpres_frame
+            ? HeapReAlloc(GetProcessHeap(), 0, s_lastpres_frame, row_bytes * h)
+            : HeapAlloc(GetProcessHeap(), 0, row_bytes * h);
+        if (!nf)
+            return;
+        s_lastpres_frame = nf;
+        s_lastpres_w = w;
+        s_lastpres_h = h;
+        s_lastpres_stride = (unsigned int)row_bytes;
+    }
+    for (y = 0; y < h; y++)
+        memcpy(s_lastpres_frame + (SIZE_T)y * s_lastpres_stride,
+                (const BYTE *)data + (SIZE_T)y * pitch, row_bytes);
+}
+
 static void wukiyo_remember_last_good_frame(const struct wined3d_sub_resource_desc *desc,
         DWORD flags, const struct wined3d_map_desc *map_desc, unsigned long avg)
 {
@@ -963,11 +1064,24 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
     wined3d_texture_get_sub_resource_desc(surface->wined3d_texture, surface->sub_resource_idx, &desc);
     wined3d_mutex_unlock();
 
-    /* CMVS sometimes reads the save thumbnail from a lockable render target
-     * directly instead of using GetRenderTargetData.  On the Metal-backed path,
-     * mapping that GPU RT can return black.  For this read-only capture case,
-     * copy the RT into a sysmem shadow first and hand CMVS the shadow map. */
-    if ((flags & D3DLOCK_READONLY)
+    /* Diag: full-resolution locks are the save-thumbnail readback candidates.
+     * Log them all, and for read-only locks also probe the GPU-side content
+     * through an independent blt so map-vs-GPU divergence is visible. */
+    if (!wukiyo_rt_capture_active && desc.width >= 640 && desc.height >= 400)
+    {
+        wukiyo_diag("LockRect surf=%p %ux%u flags=0x%lx acc=0x%x bind=0x%x rect=%s",
+                (void *)iface, desc.width, desc.height, (unsigned long)flags,
+                desc.access, desc.bind_flags, rect ? "sub" : "full");
+        if (wukiyo_observe_only && (flags & D3DLOCK_READONLY))
+            wukiyo_probe_gpu_content(iface, surface, &desc);
+    }
+
+    /* Retired 2026-06-11: the sysmem-shadow + last-good-fill route is
+     * superseded by the last-presented back-buffer serve below, which
+     * reproduces Windows windowed-present copy semantics exactly.  Kept for
+     * reference until the fix is user-verified. */
+    if (0
+            && (flags & D3DLOCK_READONLY)
             && !wukiyo_rt_capture_active
             && !s_shadow_lock_surface
             && desc.access == (WINED3D_RESOURCE_ACCESS_GPU
@@ -1072,6 +1186,47 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
         locked_rect->Pitch = map_desc.row_pitch;
         locked_rect->pBits = map_desc.data;
 
+        /* Windows windowed-present copy semantics: a READONLY lock of the
+         * implicit swapchain's back buffer returns the last presented frame.
+         * The native map is black on the Metal path, so fill it from the
+         * per-Present copy taken in wukiyo_capture_frontbuffer().  CMVS locks
+         * with an explicit full-surface rect; map_desc.data then points at
+         * the rect origin, so copy with the rect offset applied. */
+        if ((flags & D3DLOCK_READONLY) && !wukiyo_rt_capture_active
+                && map_desc.data && s_lastpres_frame
+                && desc.width == s_lastpres_w && desc.height == s_lastpres_h
+                && (desc.bind_flags & WINED3D_BIND_RENDER_TARGET))
+        {
+            unsigned int x0 = rect ? rect->left : 0;
+            unsigned int y0 = rect ? rect->top : 0;
+            unsigned int cw = rect ? (unsigned int)(rect->right - rect->left) : desc.width;
+            unsigned int ch = rect ? (unsigned int)(rect->bottom - rect->top) : desc.height;
+
+            if (cw && ch && x0 + cw <= s_lastpres_w && y0 + ch <= s_lastpres_h
+                    && map_desc.row_pitch >= cw * 4)
+            {
+                struct d3d9_device *device = CONTAINING_RECORD(surface->parent_device,
+                        struct d3d9_device, IDirect3DDevice9Ex_iface);
+                struct wined3d_texture *bb_texture = NULL;
+
+                wined3d_mutex_lock();
+                if (device->implicit_swapchain_count)
+                    bb_texture = wined3d_swapchain_get_back_buffer(device->implicit_swapchains[0], 0);
+                wined3d_mutex_unlock();
+
+                if (bb_texture && surface->wined3d_texture == bb_texture && !surface->sub_resource_idx)
+                {
+                    unsigned int y;
+                    for (y = 0; y < ch; y++)
+                        memcpy((BYTE *)map_desc.data + (SIZE_T)y * map_desc.row_pitch,
+                                s_lastpres_frame + (SIZE_T)(y0 + y) * s_lastpres_stride + (SIZE_T)x0 * 4,
+                                (SIZE_T)cw * 4);
+                    wukiyo_diag("BB_SERVE_LAST_PRESENTED surf=%p rect=(%u,%u %ux%u)",
+                            (void *)iface, x0, y0, cw, ch);
+                }
+            }
+        }
+
         /* Log ALL LockRect calls (size + flags) to identify CMVS's capture path. */
         if (map_desc.data)
         {
@@ -1129,11 +1284,34 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
                  * capture path above. */
             }
 
-            if ((desc.width == 192 && desc.height == 108)
-                    || ((flags & D3DLOCK_READONLY) && desc.width >= 640 && desc.height >= 400))
+            if (desc.width >= 640 && desc.height >= 400 && !wukiyo_rt_capture_active)
             {
                 unsigned long avg = wukiyo_log_lock_sample("LOCK_SAMPLE", iface, &desc, rect, flags, &map_desc);
-                wukiyo_remember_last_good_frame(&desc, flags, &map_desc, avg);
+                wukiyo_diag("LOCK_MAP surf=%p flags=0x%lx map_avg=%lu",
+                        (void *)iface, (unsigned long)flags, avg);
+                if (!(flags & D3DLOCK_READONLY))
+                {
+                    /* Write lock: sample again at UnlockRect to see what the
+                     * application wrote into this surface. */
+                    s_diag_write_iface = iface;
+                    s_diag_write_data  = map_desc.data;
+                    s_diag_write_pitch = map_desc.row_pitch;
+                    s_diag_write_desc  = desc;
+                }
+                if (!wukiyo_observe_only)
+                    wukiyo_remember_last_good_frame(&desc, flags, &map_desc, avg);
+            }
+            else if (desc.width == 192 && desc.height == 108)
+            {
+                static DWORD s_l192_throttle;
+                DWORD now192 = GetTickCount();
+                if ((DWORD)(now192 - s_l192_throttle) > 250)
+                {
+                    unsigned long avg = wukiyo_log_lock_sample("LOCK_SAMPLE", iface, &desc, rect, flags, &map_desc);
+                    s_l192_throttle = now192;
+                    wukiyo_diag("LOCK_192 surf=%p flags=0x%lx avg=%lu",
+                            (void *)iface, (unsigned long)flags, avg);
+                }
             }
         }
     }
@@ -1190,6 +1368,21 @@ static HRESULT WINAPI d3d9_surface_UnlockRect(IDirect3DSurface9 *iface)
         s_unlock_data  = NULL;
     }
 
+    /* Diag: sample what the application wrote into a full-resolution surface
+     * during a write lock, just before it is unmapped. */
+    if (iface == s_diag_write_iface && s_diag_write_data)
+    {
+        struct wined3d_map_desc md;
+        unsigned long avg;
+        md.data = s_diag_write_data;
+        md.row_pitch = s_diag_write_pitch;
+        md.slice_pitch = 0;
+        avg = wukiyo_log_lock_sample("DIAG_UNLOCK_WRITE", iface, &s_diag_write_desc, NULL, 0, &md);
+        wukiyo_diag("UNLOCK_WRITE surf=%p avg_after_write=%lu", (void *)iface, avg);
+        s_diag_write_iface = NULL;
+        s_diag_write_data = NULL;
+    }
+
     wined3d_mutex_lock();
     hr = wined3d_resource_unmap(wined3d_texture_get_resource(surface->wined3d_texture), surface->sub_resource_idx);
     if (SUCCEEDED(hr) && surface->texture)
@@ -1219,10 +1412,10 @@ static HRESULT WINAPI d3d9_surface_GetDC(IDirect3DSurface9 *iface, HDC *dc)
     wined3d_mutex_lock();
     hr = wined3d_texture_get_dc(surface->wined3d_texture, surface->sub_resource_idx, dc);
     wined3d_texture_get_sub_resource_desc(surface->wined3d_texture, surface->sub_resource_idx, &_d);
-    { FILE *lg = fopen("Z:\\tmp\\wukiyo_getdc.txt","a");
-      if (lg) { fprintf(lg,"GetDC hr=0x%08x surf=%p %ux%u dc=%p\n",
-          (unsigned)hr,(void*)iface,_d.width,_d.height,dc?*dc:NULL); fclose(lg); } }
     wined3d_mutex_unlock();
+
+    wukiyo_diag("GetDC surf=%p %ux%u hr=0x%08x dc=%p",
+            (void *)iface, _d.width, _d.height, (unsigned)hr, dc ? (void *)*dc : NULL);
 
     return hr;
 }
@@ -1238,12 +1431,11 @@ static HRESULT WINAPI d3d9_surface_ReleaseDC(IDirect3DSurface9 *iface, HDC dc)
     wined3d_mutex_lock();
     hr = wined3d_texture_release_dc(surface->wined3d_texture, surface->sub_resource_idx, dc);
     wined3d_texture_get_sub_resource_desc(surface->wined3d_texture, surface->sub_resource_idx, &_d);
-    { FILE *lg = fopen("Z:\\tmp\\wukiyo_getdc.txt","a");
-      if (lg) { fprintf(lg,"ReleaseDC hr=0x%08x surf=%p %ux%u dc=%p\n",
-          (unsigned)hr,(void*)iface,_d.width,_d.height,(void*)dc); fclose(lg); } }
     if (SUCCEEDED(hr) && surface->texture)
         d3d9_texture_flag_auto_gen_mipmap(surface->texture);
     wined3d_mutex_unlock();
+
+    wukiyo_diag("ReleaseDC surf=%p %ux%u hr=0x%08x", (void *)iface, _d.width, _d.height, (unsigned)hr);
 
     return hr;
 }

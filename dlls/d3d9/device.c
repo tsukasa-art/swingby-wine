@@ -44,6 +44,38 @@ DWORD wukiyo_rt_snap_tick = 0;
 /* Set while Wukiyo's private capture helpers lock their sysmem surfaces. */
 BOOL wukiyo_rt_capture_active = FALSE;
 
+/* ---- Phase-1 observation switch ----------------------------------------
+ * When TRUE, every content-substitution workaround (snap-file injection,
+ * shadow last-good fills, snap writes) is disabled so a fresh in-game save
+ * shows CMVS's NATIVE behaviour on this wine build.  All D3D9 events that
+ * matter for the save-thumbnail pipeline are logged to /tmp/wukiyo_diag.txt
+ * with a tick + present-frame stamp so call order can be reconstructed.
+ *
+ * Phase-1 findings (2026-06-11, live diag run): CMVS captures save/load
+ * thumbnails via GetBackBuffer + LockRect(READONLY, full rect) on the
+ * implicit swapchain back buffer, once per save/load screen open.  No GDI,
+ * no GetRenderTargetData, no full-res StretchRect involved.  The content is
+ * already gone at lock time even via an independent GPU blt (Present
+ * discards it on the Metal path), so the fix is the last-presented copy
+ * served in surface.c (Windows windowed-present copy semantics). */
+BOOL wukiyo_observe_only = FALSE;
+
+/* Incremented once per Present (in wukiyo_capture_frontbuffer). */
+UINT wukiyo_present_count = 0;
+
+void wukiyo_diag(const char *fmt, ...)
+{
+    FILE *f = fopen("Z:\\tmp\\wukiyo_diag.txt", "a");
+    va_list ap;
+    if (!f) return;
+    fprintf(f, "[%9lu f%6u] ", (unsigned long)GetTickCount(), wukiyo_present_count);
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+
 const struct wined3d_parent_ops d3d9_null_wined3d_parent_ops =
 {
     d3d9_null_wined3d_object_destroyed,
@@ -1334,6 +1366,18 @@ static HRESULT WINAPI d3d9_device_GetBackBuffer(IDirect3DDevice9Ex *iface, UINT 
             backbuffer_idx, backbuffer_type, backbuffer);
     wined3d_mutex_unlock();
 
+    /* Diag: identify the backbuffer surface pointer once so later LockRect /
+     * StretchRect / GetRenderTargetData events can be attributed to it. */
+    if (SUCCEEDED(hr) && *backbuffer && !wukiyo_rt_capture_active)
+    {
+        static IDirect3DSurface9 *s_last_bb;
+        if (*backbuffer != s_last_bb)
+        {
+            s_last_bb = *backbuffer;
+            wukiyo_diag("GetBackBuffer sc=%u idx=%u -> %p", swapchain, backbuffer_idx, (void *)*backbuffer);
+        }
+    }
+
     return hr;
 }
 
@@ -1404,6 +1448,10 @@ static HRESULT WINAPI d3d9_device_CreateTexture(IDirect3DDevice9Ex *iface,
 
     TRACE("iface %p, width %u, height %u, levels %u, usage %#lx, format %#x, pool %#x, texture %p, shared_handle %p.\n",
             iface, width, height, levels, usage, format, pool, texture, shared_handle);
+
+    if (width >= 640 && !wukiyo_rt_capture_active)
+        wukiyo_diag("CreateTexture %ux%u lv=%u usage=0x%lx fmt=0x%x pool=%u",
+                width, height, levels, usage, format, pool);
 
     *texture = NULL;
     if (shared_handle)
@@ -1761,9 +1809,16 @@ static HRESULT WINAPI d3d9_device_CreateRenderTarget(IDirect3DDevice9Ex *iface, 
     if (lockable)
         access |= WINED3D_RESOURCE_ACCESS_MAP_R | WINED3D_RESOURCE_ACCESS_MAP_W;
 
-    return d3d9_device_create_surface(device, 0, wined3dformat_from_d3dformat(format),
-            wined3d_multisample_type_from_d3d(multisample_type), multisample_quality, 0,
-            WINED3D_BIND_RENDER_TARGET, access, width, height, NULL, surface);
+    {
+        HRESULT hr = d3d9_device_create_surface(device, 0, wined3dformat_from_d3dformat(format),
+                wined3d_multisample_type_from_d3d(multisample_type), multisample_quality, 0,
+                WINED3D_BIND_RENDER_TARGET, access, width, height, NULL, surface);
+        if (!wukiyo_rt_capture_active)
+            wukiyo_diag("CreateRenderTarget %ux%u fmt=0x%x ms=%u lockable=%u -> %p hr=0x%lx",
+                    width, height, format, multisample_type, lockable,
+                    surface ? (void *)*surface : NULL, (unsigned long)hr);
+        return hr;
+    }
 }
 
 static HRESULT WINAPI d3d9_device_CreateDepthStencilSurface(IDirect3DDevice9Ex *iface, UINT width, UINT height,
@@ -1837,6 +1892,11 @@ static HRESULT WINAPI d3d9_device_UpdateSurface(IDirect3DDevice9Ex *iface,
         wined3d_box_set(&src_box, src_rect->left, src_rect->top, src_rect->right, src_rect->bottom, 0, 1);
     else
         wined3d_box_set(&src_box, 0, 0, src_desc.width, src_desc.height, 0, 1);
+
+    if (!wukiyo_rt_capture_active && (src_desc.width >= 256 || dst_desc.width >= 256))
+        wukiyo_diag("UpdateSurface src=%p %ux%u acc=0x%x -> dst=%p %ux%u acc=0x%x",
+                (void *)src_surface, src_desc.width, src_desc.height, src_desc.access,
+                (void *)dst_surface, dst_desc.width, dst_desc.height, dst_desc.access);
 
     hr = wined3d_device_context_copy_sub_resource_region(device->immediate_context,
             wined3d_texture_get_resource(dst->wined3d_texture), dst->sub_resource_idx, dst_point ? dst_point->x : 0,
@@ -1923,26 +1983,18 @@ static HRESULT WINAPI d3d9_device_GetRenderTargetData(IDirect3DDevice9Ex *iface,
                 rt_impl->wined3d_texture, rt_impl->sub_resource_idx, &src_rect, 0, NULL, WINED3D_TEXF_POINT);
     wined3d_mutex_unlock();
 
-    {
-        FILE *lg = fopen("Z:\\tmp\\wukiyo_trace.txt", "a");
-        if (lg)
-        {
-            fprintf(lg,
-                    "GetRTData direct hr=0x%08lx src=%p %ux%u fmt=0x%x acc=0x%x bind=0x%x dst=%p %ux%u fmt=0x%x acc=0x%x bind=0x%x%s\n",
-                    (unsigned long)hr, (void *)render_target, rt_desc.width, rt_desc.height,
-                    rt_desc.format, rt_desc.access, rt_desc.bind_flags, (void *)dst_surface,
-                    dst_desc.width, dst_desc.height, dst_desc.format, dst_desc.access,
-                    dst_desc.bind_flags, dst_is_cmvs_readback ? " cmvs-readback" : "");
-            fclose(lg);
-        }
-    }
+    wukiyo_diag("GetRenderTargetData hr=0x%08lx src=%p %ux%u acc=0x%x bind=0x%x -> dst=%p %ux%u acc=0x%x bind=0x%x%s",
+            (unsigned long)hr, (void *)render_target, rt_desc.width, rt_desc.height,
+            rt_desc.access, rt_desc.bind_flags, (void *)dst_surface,
+            dst_desc.width, dst_desc.height, dst_desc.access,
+            dst_desc.bind_flags, dst_is_cmvs_readback ? " cmvs-readback" : "");
 
     if (SUCCEEDED(hr))
     {
         extern void wukiyo_on_get_render_target_data(IDirect3DSurface9 *s, IDirect3DSurface9 *d);
         wukiyo_on_get_render_target_data(render_target, dst_surface);
 
-        if (!dst_is_192x108)
+        if (!wukiyo_observe_only && !dst_is_192x108)
             /* Support Wukiyo's later persistence patch with the same RT pixels.
              * The live preview path itself is the direct RT -> dst_surface copy above. */
             wukiyo_capture_rt_to_snap(iface, device, rt_impl);
@@ -1991,9 +2043,11 @@ static HRESULT WINAPI d3d9_device_GetFrontBufferData(IDirect3DDevice9Ex *iface,
                 dst_impl->wined3d_texture, dst_impl->sub_resource_idx);
     wined3d_mutex_unlock();
 
+    wukiyo_diag("GetFrontBufferData sw=%u dst=%p hr=0x%08lx", swapchain, (void *)dst_surface, (unsigned long)hr);
+
     /* Wukiyo: the CG compositor path returns the full macOS desktop (including other windows).
      * Overwrite with wukiyo_snap.bgra which correctly contains only the game's own frame. */
-    if (SUCCEEDED(hr))
+    if (SUCCEEDED(hr) && !wukiyo_observe_only)
     {
         D3DLOCKED_RECT lr;
         if (SUCCEEDED(IDirect3DSurface9_LockRect(dst_surface, &lr, NULL, 0)))
@@ -2052,13 +2106,27 @@ static HRESULT WINAPI d3d9_device_StretchRect(IDirect3DDevice9Ex *iface, IDirect
         src_rect = &s;
     }
 
-    /* Wukiyo: log ALL StretchRect calls so we can identify CMVS's capture path. */
-    { static DWORD s_sr_throttle = 0; DWORD _now = GetTickCount();
-      if ((DWORD)(_now - s_sr_throttle) > 500) { /* log at most every 0.5s to avoid spam */
-        FILE *lg = fopen("Z:\\tmp\\wukiyo_stretch.txt","a");
-        if (lg) { fprintf(lg,"StretchRect src=%ux%u(acc=0x%x) dst=%ux%u(acc=0x%x)\n",
-            src_desc.width,src_desc.height,src_desc.access,
-            dst_desc.width,dst_desc.height,dst_desc.access); fclose(lg); s_sr_throttle=_now; } } }
+    /* Diag: full-resolution StretchRects un-throttled (these are how the capture
+     * surface is most likely filled); 192x108 dst throttled (save-screen preview
+     * rendering repeats every frame). */
+    if (!wukiyo_rt_capture_active)
+    {
+        if (src_desc.width >= 640 || dst_desc.width >= 640)
+            wukiyo_diag("StretchRect src=%p %ux%u acc=0x%x bind=0x%x -> dst=%p %ux%u acc=0x%x bind=0x%x",
+                    (void *)src_surface, src_desc.width, src_desc.height, src_desc.access, src_desc.bind_flags,
+                    (void *)dst_surface, dst_desc.width, dst_desc.height, dst_desc.access, dst_desc.bind_flags);
+        else if (dst_desc.width == 192 && dst_desc.height == 108)
+        {
+            static DWORD s_sr192_throttle = 0;
+            DWORD _now = GetTickCount();
+            if ((DWORD)(_now - s_sr192_throttle) > 250)
+            {
+                s_sr192_throttle = _now;
+                wukiyo_diag("StretchRect192 src=%p %ux%u -> dst=%p (save screen active)",
+                        (void *)src_surface, src_desc.width, src_desc.height, (void *)dst_surface);
+            }
+        }
+    }
 
     if (dst_desc.access & WINED3D_RESOURCE_ACCESS_CPU)
     {
@@ -2242,8 +2310,14 @@ static HRESULT WINAPI d3d9_device_CreateOffscreenPlainSurface(IDirect3DDevice9Ex
     if (!device->d3d_parent->extended)
         usage |= WINED3DUSAGE_VIDMEM_ACCOUNTING;
 
-    return d3d9_device_create_surface(device, 0, wined3dformat_from_d3dformat(format),
-            WINED3D_MULTISAMPLE_NONE, 0, usage, 0, access, width, height, user_mem, surface);
+    {
+        HRESULT hr = d3d9_device_create_surface(device, 0, wined3dformat_from_d3dformat(format),
+                WINED3D_MULTISAMPLE_NONE, 0, usage, 0, access, width, height, user_mem, surface);
+        if (!wukiyo_rt_capture_active)
+            wukiyo_diag("CreateOffscreenPlainSurface %ux%u fmt=0x%x pool=%u -> %p hr=0x%lx",
+                    width, height, format, pool, surface ? (void *)*surface : NULL, (unsigned long)hr);
+        return hr;
+    }
 }
 
 /* Capture any GPU surface → wukiyo_snap.bgra via wined3d_device_context_blt.
@@ -2325,10 +2399,30 @@ static void wukiyo_capture_frontbuffer(IDirect3DDevice9Ex *iface, struct d3d9_de
     BOOL is_trigger;
     BOOL write_snap;
 
+    wukiyo_present_count++;
+
+    if (wukiyo_observe_only)
+    {
+        /* Observation build: no captures, no snap writes.  Keep the cooldown
+         * counter decaying so 192x108 markers stay meaningful, and emit a
+         * heartbeat so wall-clock time can be mapped to present frames. */
+        if (wukiyo_save_screen_cooldown > 0)
+            wukiyo_save_screen_cooldown--;
+        if (!(wukiyo_present_count % 600))
+            wukiyo_diag("PRESENT heartbeat cooldown=%u", wukiyo_save_screen_cooldown);
+        return;
+    }
+
+    /* The last-presented cache must update on EVERY Present — Windows keeps
+     * the presented frame in the back buffer regardless of which screen is
+     * showing, and CMVS re-captures whenever a save/load screen opens.  The
+     * old cooldown early-return (freezing a "pre-save" frame) is retired;
+     * cooldown now only decays as a save-screen activity marker. */
     { FILE *t = fopen(snap_trigger, "rb");
       if (t) { fclose(t); remove(snap_trigger); is_trigger = TRUE; write_snap = TRUE; snap_file_frame = 0; }
       else {
-          if (wukiyo_save_screen_cooldown > 0) { wukiyo_save_screen_cooldown--; return; }
+          if (wukiyo_save_screen_cooldown > 0)
+              wukiyo_save_screen_cooldown--;
           is_trigger = FALSE;
           write_snap = ++snap_file_frame >= 15;
           if (write_snap)
@@ -2367,6 +2461,14 @@ static void wukiyo_capture_frontbuffer(IDirect3DDevice9Ex *iface, struct d3d9_de
     wukiyo_rt_capture_active = TRUE;
     if (SUCCEEDED(IDirect3DSurface9_LockRect(sys, &lr, NULL, D3DLOCK_READONLY)))
     {
+        /* Feed the in-process last-presented cache (Windows windowed-present
+         * copy semantics; served on back-buffer READONLY locks in surface.c). */
+        {
+            extern void wukiyo_store_last_presented(const void *data, unsigned int pitch,
+                    unsigned int w, unsigned int h);
+            wukiyo_store_last_presented(lr.pBits, (unsigned int)lr.Pitch, desc.Width, desc.Height);
+        }
+
         if (write_snap)
         {
             f = fopen(snap_out, "wb");
@@ -2425,6 +2527,27 @@ static HRESULT WINAPI d3d9_device_SetRenderTarget(IDirect3DDevice9Ex *iface, DWO
         if (!idx)
             device_reset_viewport_state(device);
         device->render_targets[idx] = surface_impl;
+
+        /* Diag: log RT changes (deduplicated) to see which surface the scene
+         * and the save-screen UI are composed into. */
+        if (idx < 4)
+        {
+            static IDirect3DSurface9 *s_last_rt[4];
+            if (surface != s_last_rt[idx])
+            {
+                s_last_rt[idx] = surface;
+                if (surface_impl)
+                {
+                    struct wined3d_sub_resource_desc d;
+                    wined3d_texture_get_sub_resource_desc(surface_impl->wined3d_texture,
+                            surface_impl->sub_resource_idx, &d);
+                    wukiyo_diag("SetRenderTarget idx=%lu surf=%p %ux%u acc=0x%x bind=0x%x",
+                            idx, (void *)surface, d.width, d.height, d.access, d.bind_flags);
+                }
+                else
+                    wukiyo_diag("SetRenderTarget idx=%lu surf=NULL", idx);
+            }
+        }
     }
     wined3d_mutex_unlock();
 
