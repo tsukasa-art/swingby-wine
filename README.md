@@ -2,7 +2,7 @@
 
 A personal patch set forked from [Sikarugir-App/wine](https://github.com/Sikarugir-App/wine) (Wine 10.0, LGPL), targeting macOS (Apple Silicon / Rosetta 2). Built for use with the [Wukiyo](https://github.com/tsukasa-art/Wukiyo) launcher.
 
-[Wine](https://gitlab.winehq.org/wine/wine) is the foundation that makes all of this possible. [Sikarugir](https://github.com/Sikarugir-App/Creator) (formerly Kegworks) maintains the macOS-specific Wine fork this repo is based on, and provides the app bundle — Wine runtime, DXVK, MoltenVK, and prefix management — that serves as the deployment target for these patches. Both projects do the heavy lifting; this repo only adds the two hooks described below.
+[Wine](https://gitlab.winehq.org/wine/wine) is the foundation that makes all of this possible. [Sikarugir](https://github.com/Sikarugir-App/Creator) (formerly Kegworks) maintains the macOS-specific Wine fork this repo is based on — both projects do the heavy lifting; this repo only adds the two hooks described below. The built Wine binary is bundled inside [Wukiyo.app](https://github.com/tsukasa-art/Wukiyo) under `Contents/Resources/wine-support/` and driven directly by the Swift launcher.
 
 ## Patches
 
@@ -18,8 +18,8 @@ Hooks into the D3D9 `LockRect` / `UnlockRect` cycle of save-screen surfaces (192
 
 How it works:
 
-1. Wukiyo captures the game window via ScreenCaptureKit and writes `~/.wukiyo_snaps/wukiyo_snap_NNN.bgra` at save time.
-2. `surface.c` detects 192×108 `LockRect` calls, reads `page_base.txt` to compute the target slot, and blits the BGRA snap over the game's write after `UnlockRect`.
+1. Wukiyo captures the game window via ScreenCaptureKit and writes `/tmp/wukiyo_snap_NNN.bgra` at save time (also mirrored to `~/.wukiyo_snaps/` as a persistent fallback).
+2. `surface.c` detects 192×108 `LockRect` calls, reads `/tmp/wukiyo_page_base.txt` to compute the target slot, and blits the BGRA snap over the game's write after `UnlockRect`.
 
 Snap file format: `[u32 width][u32 height][u32 stride] + BGRA pixels (top-down)`.
 
@@ -48,18 +48,25 @@ arch -x86_64 make -s -j$(sysctl -n hw.activecpu)
 
 Produces x86_64 binaries that run under Rosetta 2.
 
-## Deploy into Sikarugir
+## Deploy into Wukiyo
 
-The built `.so` files replace their counterparts inside a Sikarugir wrapper. ABI must match — build from Wine 10.0 for Sikarugir's `WS12WineSikarugir10.0_x` engine.
+The built `.so` files replace their counterparts inside `Wukiyo.app/Contents/Resources/wine-support/`. ABI must match — build from Wine 10.0 (the `wukiyo-thumbnail-injection` branch base).
 
 ```bash
-TARGET=~/Applications/Sikarugir/<GameTitle>.app/Contents/SharedSupport/wine/lib/wine/x86_64-unix/winemac.so
-cp $TARGET ${TARGET}.bak
-cp build/dlls/winemac.drv/winemac.so $TARGET
-codesign --force --sign - $TARGET
+WINE_LIB=~/Applications/Wukiyo.app/Contents/Resources/wine-support/wine/lib/wine/x86_64-unix
+
+# winemac patch
+cp build/dlls/winemac.drv/winemac.so "$WINE_LIB/winemac.so"
+codesign --force --sign - "$WINE_LIB/winemac.so"
+
+# d3d9 thumbnail injection
+cp build/dlls/d3d9/d3d9.dll.so "$WINE_LIB/d3d9.dll.so"
+codesign --force --sign - "$WINE_LIB/d3d9.dll.so"
 ```
 
-**Note on notarization**: Replacing `.so` files invalidates Sikarugir's original notarization for those components. The modified bundle runs on your own Mac (with Terminal listed under Privacy & Security → Developer Tools) but cannot be distributed to others. A proper Developer ID certificate and re-notarization would be required for distribution — that is out of scope for this personal project at the moment.
+Alternatively, use the `deploy.sh` / `deploy_d3d9.sh` scripts in the Wukiyo repo which handle paths and re-signing automatically.
+
+**Note on notarization**: Ad-hoc re-signing (`-`) is sufficient for running on your own Mac (with Terminal listed under Privacy & Security → Developer Tools). Distribution requires a Developer ID certificate and full re-notarization of Wukiyo.app.
 
 ## Notes on D3D9
 
@@ -70,7 +77,7 @@ D3DMetal (Apple GPTK) covers D3D11/D3D12/DXGI/DDraw but **not** D3D9; d9vk remai
 ## Related
 
 - [Wukiyo](https://github.com/tsukasa-art/Wukiyo) — macOS launcher and HUD that drives the thumbnail injection
-- [Sikarugir](https://github.com/Sikarugir-App/Creator) — Wine wrapper for macOS that provides the deployment target
+- [Sikarugir](https://github.com/Sikarugir-App/Creator) — macOS Wine fork this repo is based on
 - [Zenn: Mac で美少女ゲームを動かす](https://zenn.dev/tsukasa_art/articles/mac-eroge-compat-part1) — series documenting the compatibility work
 
 ---
