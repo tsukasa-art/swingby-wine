@@ -2100,6 +2100,16 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start
     void *ptr;
     int prot = get_unix_prot( vprot | VPROT_COMMITTED /* make sure it is accessible */ );
     unsigned int flags = MAP_FIXED | ((vprot & VPROT_WRITECOPY) ? MAP_PRIVATE : MAP_SHARED);
+#ifdef __APPLE__
+    /* macOS (since 10.15) refuses to mmap() a file with PROT_EXEC, and would otherwise hit
+     * an AMFI denial on file-backed MAP_SHARED|PROT_EXEC mappings (e.g. PAGE_EXECUTE_READ
+     * sections used by CD-protected/packed titles). It does allow adding PROT_EXEC with a
+     * subsequent mprotect(), so map without PROT_EXEC and re-apply it below.
+     * Ported from Sikarugir/CrossOver out-of-tree patches "Avoid mmap() failures ... when
+     * mapping files with PROT_EXEC" + "Always rely on mprotect() to set PROT_EXEC". */
+    int exec_prot = prot & PROT_EXEC;
+    prot &= ~PROT_EXEC;
+#endif
 
     assert( start < view->size );
     assert( start + size <= view->size );
@@ -2108,7 +2118,11 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start
     {
         TRACE( "forcing exec permission on mapping %p-%p\n",
                (char *)view->base + start, (char *)view->base + start + size - 1 );
+#ifdef __APPLE__
+        exec_prot = PROT_EXEC;
+#else
         prot |= PROT_EXEC;
+#endif
     }
 
     /* only try mmap if media is not removable (or if we require write access) */
@@ -2158,6 +2172,10 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start
     pread( fd, ptr, size, offset );
     if (prot != (PROT_READ|PROT_WRITE)) mprotect( ptr, size, prot );  /* Set the right protection */
 done:
+#ifdef __APPLE__
+    /* apply PROT_EXEC separately: macOS forbids it at mmap() time but allows it via mprotect() */
+    if (exec_prot) mprotect( (char *)view->base + start, size, prot | PROT_EXEC );
+#endif
     set_page_vprot( (char *)view->base + start, size, vprot );
     return STATUS_SUCCESS;
 }
