@@ -45,9 +45,32 @@ struct thunk_opcodes
     struct thunk_32to64 syscall_thunk;
     struct thunk_32to64 unix_thunk;
 };
+/* Rosetta 2 does not switch mode on a far jmp, but it does on a far call /
+ * far return.  So under Rosetta the 32->64 thunk is a far call whose pushed
+ * frame is discarded by a 64-bit stub that then jumps to the real entry,
+ * and the 64->32 exits use lretq/iretq (cf. the Sikarugir/CrossOver
+ * engine binaries this was ported from). */
+struct rosetta_thunk_32to64
+{
+    BYTE    lcall;     /* far call, absolute indirect (ff /3) */
+    BYTE    modrm;     /* address=disp32, opcode=3 */
+    DWORD   op;        /* -> &addr (m16:32 far pointer) */
+    DWORD   addr;      /* -> &code64 */
+    WORD    cs;
+    BYTE    code64[9]; /* add $8,%esp ; jmp *0(%rip) */
+    ULONG64 target;
+};
+struct rosetta_thunk_opcodes
+{
+    struct rosetta_thunk_32to64 syscall_thunk;
+    struct rosetta_thunk_32to64 unix_thunk;
+};
 #include "poppack.h"
 
 static BYTE DECLSPEC_ALIGN(4096) code_buffer[0x1000];
+
+/* referenced from inline asm, hence not static */
+int wukiyo_is_rosetta = 0;
 
 static USHORT cs64_sel;
 static USHORT ds64_sel;
@@ -206,7 +229,15 @@ __ASM_GLOBAL_FUNC( syscall_32to64,
                    "movl %edx,4(%rsp)\n\t"
                    "movl 0xc4(%r13),%r14d\n\t"  /* context->Esp */
                    "xchgq %r14,%rsp\n\t"
+                   "cmpl $0,wukiyo_is_rosetta(%rip)\n\t"
+                   "jne 1f\n\t"
                    "ljmp *(%r14)\n"
+                   "1:\tsubq $0x10,%rsp\n\t"     /* Rosetta: far return instead of far jmp */
+                   "movl 4(%r14),%edx\n\t"
+                   "movq %rdx,8(%rsp)\n\t"
+                   "movl (%r14),%edx\n\t"
+                   "movq %rdx,(%rsp)\n\t"
+                   "lretq\n"
                    ".Lsyscall_32to64_return:\n\t"
                    "movq %rsp,%r14\n\t"
                    "movl 0xa8(%r13),%edx\n\t"   /* context->Edx */
@@ -263,7 +294,15 @@ __ASM_GLOBAL_FUNC( unix_call_32to64,
                    "movl %edx,4(%rsp)\n\t"
                    "movl 0xc4(%r13),%r14d\n\t"  /* context->Esp */
                    "xchgq %r14,%rsp\n\t"
-                   "ljmp *(%r14)" )
+                   "cmpl $0,wukiyo_is_rosetta(%rip)\n\t"
+                   "jne 1f\n\t"
+                   "ljmp *(%r14)\n"
+                   "1:\tsubq $0x10,%rsp\n\t"     /* Rosetta: far return instead of far jmp */
+                   "movl 4(%r14),%edx\n\t"
+                   "movq %rdx,8(%rsp)\n\t"
+                   "movl (%r14),%edx\n\t"
+                   "movq %rdx,(%rsp)\n\t"
+                   "lretq" )
 
 
 /**********************************************************************
@@ -318,17 +357,51 @@ NTSTATUS WINAPI BTCpuProcessInit(void)
     ds64_sel = context.SegDs;
     fs32_sel = context.SegFs;
 
-    thunk->syscall_thunk.ljmp  = 0xff;
-    thunk->syscall_thunk.modrm = 0x2d;
-    thunk->syscall_thunk.op    = PtrToUlong( &thunk->syscall_thunk.addr );
-    thunk->syscall_thunk.addr  = PtrToUlong( syscall_32to64 );
-    thunk->syscall_thunk.cs    = cs64_sel;
+    {
+        char brand[0x40];
 
-    thunk->unix_thunk.ljmp  = 0xff;
-    thunk->unix_thunk.modrm = 0x2d;
-    thunk->unix_thunk.op    = PtrToUlong( &thunk->unix_thunk.addr );
-    thunk->unix_thunk.addr  = PtrToUlong( unix_call_32to64 );
-    thunk->unix_thunk.cs    = cs64_sel;
+        if (!NtQuerySystemInformation( SystemProcessorBrandString, brand, sizeof(brand), NULL ))
+            wukiyo_is_rosetta = strstr( brand, "VirtualApple" ) != NULL;
+    }
+
+    if (wukiyo_is_rosetta)
+    {
+        static const BYTE code64[] = { 0x83, 0xc4, 0x08,                    /* add $8,%esp (discard far-call frame) */
+                                       0xff, 0x25, 0x00, 0x00, 0x00, 0x00   /* jmp *0(%rip) -> target */ };
+        struct rosetta_thunk_opcodes *rthunk = (struct rosetta_thunk_opcodes *)code_buffer;
+
+        rthunk->syscall_thunk.lcall  = 0xff;
+        rthunk->syscall_thunk.modrm  = 0x1d;
+        rthunk->syscall_thunk.op     = PtrToUlong( &rthunk->syscall_thunk.addr );
+        rthunk->syscall_thunk.addr   = PtrToUlong( rthunk->syscall_thunk.code64 );
+        rthunk->syscall_thunk.cs     = cs64_sel;
+        memcpy( rthunk->syscall_thunk.code64, code64, sizeof(code64) );
+        rthunk->syscall_thunk.target = (ULONG_PTR)syscall_32to64;
+
+        rthunk->unix_thunk.lcall  = 0xff;
+        rthunk->unix_thunk.modrm  = 0x1d;
+        rthunk->unix_thunk.op     = PtrToUlong( &rthunk->unix_thunk.addr );
+        rthunk->unix_thunk.addr   = PtrToUlong( rthunk->unix_thunk.code64 );
+        rthunk->unix_thunk.cs     = cs64_sel;
+        memcpy( rthunk->unix_thunk.code64, code64, sizeof(code64) );
+        rthunk->unix_thunk.target = (ULONG_PTR)unix_call_32to64;
+
+        TRACE( "rosetta detected, using far-call thunks\n" );
+    }
+    else
+    {
+        thunk->syscall_thunk.ljmp  = 0xff;
+        thunk->syscall_thunk.modrm = 0x2d;
+        thunk->syscall_thunk.op    = PtrToUlong( &thunk->syscall_thunk.addr );
+        thunk->syscall_thunk.addr  = PtrToUlong( syscall_32to64 );
+        thunk->syscall_thunk.cs    = cs64_sel;
+
+        thunk->unix_thunk.ljmp  = 0xff;
+        thunk->unix_thunk.modrm = 0x2d;
+        thunk->unix_thunk.op    = PtrToUlong( &thunk->unix_thunk.addr );
+        thunk->unix_thunk.addr  = PtrToUlong( unix_call_32to64 );
+        thunk->unix_thunk.cs    = cs64_sel;
+    }
 
     NtProtectVirtualMemory( GetCurrentProcess(), (void **)&thunk, &size, PAGE_EXECUTE_READ, &old_prot );
     return STATUS_SUCCESS;
@@ -340,9 +413,9 @@ NTSTATUS WINAPI BTCpuProcessInit(void)
  */
 void * WINAPI BTCpuGetBopCode(void)
 {
-    struct thunk_opcodes *thunk = (struct thunk_opcodes *)code_buffer;
-
-    return &thunk->syscall_thunk;
+    if (wukiyo_is_rosetta)
+        return &((struct rosetta_thunk_opcodes *)code_buffer)->syscall_thunk;
+    return &((struct thunk_opcodes *)code_buffer)->syscall_thunk;
 }
 
 
@@ -351,9 +424,9 @@ void * WINAPI BTCpuGetBopCode(void)
  */
 void * WINAPI __wine_get_unix_opcode(void)
 {
-    struct thunk_opcodes *thunk = (struct thunk_opcodes *)code_buffer;
-
-    return &thunk->unix_thunk;
+    if (wukiyo_is_rosetta)
+        return &((struct rosetta_thunk_opcodes *)code_buffer)->unix_thunk;
+    return &((struct thunk_opcodes *)code_buffer)->unix_thunk;
 }
 
 
