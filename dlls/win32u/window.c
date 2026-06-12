@@ -1297,6 +1297,22 @@ LONG_PTR set_window_long( HWND hwnd, INT offset, UINT size, LONG_PTR newval, BOO
         WNDPROC proc;
         UINT old_flags = win->flags;
         retval = get_window_long_ptr( hwnd, offset, ansi );
+        /* wukiyo: self-subclass guard. Winproc entries are never freed, so
+         * when an app frees a wndproc thunk and its heap address is reused
+         * for a new thunk, the "previous proc" we return here equals the
+         * proc being installed. A forwarding subclass that stores it then
+         * calls itself forever (WM_WINDOWPOSCHANGING stack overflow,
+         * observed with yaneurao GameSDK settings dialogs). Winproc handles
+         * are 0xffffNNNN-shaped and can't collide with heap pointers, so a
+         * raw-pointer equality check captures exactly the broken case;
+         * return the class proc instead, which is what a fresh window's
+         * subclass would have seen. */
+        if (retval && retval == newval && win->class)
+        {
+            WARN( "self-referencing subclass proc %p on %p, returning class proc\n",
+                  (void *)newval, hwnd );
+            retval = (LONG_PTR)get_winproc( get_class_winproc( win->class ), ansi );
+        }
         proc = alloc_winproc( (WNDPROC)newval, ansi );
         if (proc) win->winproc = proc;
         if (is_winproc_unicode( proc, !ansi )) win->flags |= WIN_ISUNICODE;
