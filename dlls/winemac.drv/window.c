@@ -164,6 +164,40 @@ static void constrain_window_frame(CGPoint* origin, CGSize* size)
         if (size->width > max_width) size->width = max_width;
         if (size->height > max_height) size->height = max_height;
     }
+
+    /* wukiyo: nudge fully off-screen windows back onto a display.
+     *
+     * Some Windows engines (notably iarsys / Artemis VN engines) re-center their
+     * top-level window at startup using a coordinate space that does not match
+     * Wine's, landing the entire window outside the visible desktop (observed:
+     * origin x=1676 on a 1512-wide display) so the user "launches but sees
+     * nothing".  Wine's display metrics are correct; the app simply asked for an
+     * off-screen position.  When a window would have NO intersection with the
+     * desktop at all, shift its origin so it is visible again.  Windows that
+     * merely straddle an edge (normal dragging, multi-monitor) keep an
+     * intersection and are left untouched, so this does not disturb legitimate
+     * placement. */
+    if (origin && size && size->width >= 1 && size->height >= 1)
+    {
+        CGRect frame = CGRectMake(origin->x, origin->y, size->width, size->height);
+        if (!CGRectIsEmpty(desktop_rect) && !CGRectIntersectsRect(frame, desktop_rect))
+        {
+            CGFloat old_x = origin->x, old_y = origin->y;
+            /* Center the rescued window on the desktop.  Apps that land fully
+             * off-screen are almost always mis-computing a centered position
+             * (e.g. the iarsys/Artemis VN engines), so centering matches intent.
+             * If the window is larger than the desktop, keep its top-left corner
+             * on-screen so the title bar stays reachable. */
+            origin->x = CGRectGetMinX(desktop_rect) + (CGRectGetWidth(desktop_rect) - size->width) / 2;
+            origin->y = CGRectGetMinY(desktop_rect) + (CGRectGetHeight(desktop_rect) - size->height) / 2;
+            if (origin->x < CGRectGetMinX(desktop_rect))
+                origin->x = CGRectGetMinX(desktop_rect);
+            if (origin->y < CGRectGetMinY(desktop_rect))
+                origin->y = CGRectGetMinY(desktop_rect);
+            TRACE("wukiyo: recentered off-screen window from (%g,%g) to (%g,%g) into desktop %s\n",
+                  old_x, old_y, origin->x, origin->y, wine_dbgstr_cgrect(desktop_rect));
+        }
+    }
 }
 
 
