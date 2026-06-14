@@ -63,10 +63,36 @@ BOOL wukiyo_observe_only = FALSE;
 /* Incremented once per Present (in wukiyo_capture_frontbuffer). */
 UINT wukiyo_present_count = 0;
 
+/* ---- Master gate for the whole Wukiyo CMVS save-thumbnail capture system ----
+ * Default OFF.  When OFF, every Wukiyo d3d9 hook (per-Present back-buffer
+ * capture, last-presented serve on READONLY locks, snap injection, all diag
+ * logging) becomes a no-op, so d3d9.dll behaves exactly like the stock wine
+ * builtin.  This is REQUIRED for non-CMVS engines: KiriKiri Z white-screened on
+ * wined3d because the always-on capture corrupted its normal back-buffer locks
+ * (the failure was cross-backend — gl and vulkan both — because the corruption
+ * lives in the d3d9 layer above wined3d, not in a wined3d backend).
+ *
+ * The Wukiyo launcher sets WUKIYO_CMVS_THUMBS=1 only for the CMVS EngineProfile,
+ * where the save-thumbnail capture is actually needed (and CMVS already runs on
+ * wined3d, not DXVK). */
+BOOL wukiyo_capture_is_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *e = getenv("WUKIYO_CMVS_THUMBS");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
 void wukiyo_diag(const char *fmt, ...)
 {
-    FILE *f = fopen("Z:\\tmp\\wukiyo_diag.txt", "a");
+    FILE *f;
     va_list ap;
+    if (!wukiyo_capture_is_enabled())
+        return;
+    f = fopen("Z:\\tmp\\wukiyo_diag.txt", "a");
     if (!f) return;
     fprintf(f, "[%9lu f%6u] ", (unsigned long)GetTickCount(), wukiyo_present_count);
     va_start(ap, fmt);
@@ -1991,17 +2017,20 @@ static HRESULT WINAPI d3d9_device_GetRenderTargetData(IDirect3DDevice9Ex *iface,
 
     if (SUCCEEDED(hr))
     {
-        extern void wukiyo_on_get_render_target_data(IDirect3DSurface9 *s, IDirect3DSurface9 *d);
-        wukiyo_on_get_render_target_data(render_target, dst_surface);
+        if (wukiyo_capture_is_enabled())
+        {
+            extern void wukiyo_on_get_render_target_data(IDirect3DSurface9 *s, IDirect3DSurface9 *d);
+            wukiyo_on_get_render_target_data(render_target, dst_surface);
 
-        if (!wukiyo_observe_only && !dst_is_192x108)
-            /* Support Wukiyo's later persistence patch with the same RT pixels.
-             * The live preview path itself is the direct RT -> dst_surface copy above. */
-            wukiyo_capture_rt_to_snap(iface, device, rt_impl);
+            if (!wukiyo_observe_only && !dst_is_192x108)
+                /* Support Wukiyo's later persistence patch with the same RT pixels.
+                 * The live preview path itself is the direct RT -> dst_surface copy above. */
+                wukiyo_capture_rt_to_snap(iface, device, rt_impl);
+        }
         return hr;
     }
 
-    if (dst_is_cmvs_readback)
+    if (!wukiyo_capture_is_enabled() || dst_is_cmvs_readback)
         return hr;
 
     /* Non-CMVS fallback only.  CMVS save thumbnails need Windows semantics:
@@ -2035,6 +2064,7 @@ static HRESULT WINAPI d3d9_device_GetFrontBufferData(IDirect3DDevice9Ex *iface,
     HRESULT hr = D3DERR_INVALIDCALL;
 
     TRACE("iface %p, swapchain %u, dst_surface %p.\n", iface, swapchain, dst_surface);
+    if (wukiyo_capture_is_enabled())
     { FILE *f = fopen("/tmp/d3d9_cap.log","a"); if(f){fprintf(f,"GetFrontBufferData sw=%u dst=%p\n",swapchain,dst_surface);fclose(f);} }
 
     wined3d_mutex_lock();
@@ -2047,7 +2077,7 @@ static HRESULT WINAPI d3d9_device_GetFrontBufferData(IDirect3DDevice9Ex *iface,
 
     /* Wukiyo: the CG compositor path returns the full macOS desktop (including other windows).
      * Overwrite with wukiyo_snap.bgra which correctly contains only the game's own frame. */
-    if (SUCCEEDED(hr) && !wukiyo_observe_only)
+    if (SUCCEEDED(hr) && !wukiyo_observe_only && wukiyo_capture_is_enabled())
     {
         D3DLOCKED_RECT lr;
         if (SUCCEEDED(IDirect3DSurface9_LockRect(dst_surface, &lr, NULL, 0)))
@@ -2398,6 +2428,9 @@ static void wukiyo_capture_frontbuffer(IDirect3DDevice9Ex *iface, struct d3d9_de
     UINT row;
     BOOL is_trigger;
     BOOL write_snap;
+
+    if (!wukiyo_capture_is_enabled())
+        return;
 
     wukiyo_present_count++;
 

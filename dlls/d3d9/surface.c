@@ -254,6 +254,7 @@ extern DWORD wukiyo_snap_tick;
 extern DWORD wukiyo_rt_snap_tick;
 extern BOOL wukiyo_rt_capture_active;
 extern BOOL wukiyo_observe_only;
+extern BOOL wukiyo_capture_is_enabled(void);
 extern void wukiyo_diag(const char *fmt, ...);
 
 static void wukiyo_free_pix_cache(void); /* forward declaration */
@@ -1186,6 +1187,13 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
         locked_rect->Pitch = map_desc.row_pitch;
         locked_rect->pBits = map_desc.data;
 
+        /* Wukiyo CMVS save-thumbnail capture: only when explicitly enabled by
+         * the launcher (WUKIYO_CMVS_THUMBS=1).  When OFF this whole block is
+         * skipped so LockRect is byte-for-byte stock wine — required so the
+         * last-presented serve below never corrupts non-CMVS games' back-buffer
+         * READONLY locks (the KiriKiri Z white-screen). */
+        if (wukiyo_capture_is_enabled())
+        {
         /* Windows windowed-present copy semantics: a READONLY lock of the
          * implicit swapchain's back buffer returns the last presented frame.
          * The native map is black on the Metal path, so fill it from the
@@ -1314,6 +1322,7 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
                 }
             }
         }
+        } /* end if (wukiyo_capture_is_enabled()) */
     }
 
     if (hr == E_INVALIDARG)
