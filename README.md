@@ -1,8 +1,8 @@
 # wine-wukiyo
 
-A personal Wine fork targeting macOS (Apple Silicon / Rosetta 2), built for use with the [Wukiyo](https://github.com/tsukasa-art/Wukiyo) launcher. The git base is the **vanilla [WineHQ](https://gitlab.winehq.org/wine/wine) Wine 10.0 release** (`b0738596` "Release 10.0."); all macOS/Rosetta compatibility work is carried by this fork's own patches. This repository is the source of truth for Wukiyo's bundled Wine runtime, and WineHQ is the upstream to rebase onto.
+A personal Wine fork targeting macOS (Apple Silicon / Rosetta 2), built for use with the [Wukiyo](https://github.com/tsukasa-art/Wukiyo) launcher. Based on the [WineHQ](https://gitlab.winehq.org/wine/wine) **Wine 10.0 release** (`b0738596`), it carries this fork's own macOS/Rosetta compatibility patches. This repository is the source of truth for Wukiyo's bundled Wine runtime; WineHQ is the upstream to rebase onto.
 
-[Sikarugir](https://github.com/Sikarugir-App/Creator) (formerly Kegworks) is the macOS Wine lineage this project was originally inspired by, but it is **credit/lineage only** — the measured source delta over WineHQ 10.0 in this repo is zero (no Sikarugir commits are carried here; the macOS-critical fixes such as the Rosetta far-call thunks and the binutils delay-load fix are this fork's own). Wukiyo must ship binaries that trace back to this fork and to the runtime manifest in the launcher repository. See [WUKIYO_PATCHES.md](WUKIYO_PATCHES.md) for the responsibility boundary and patch classification.
+Inspired by the macOS Wine work of [Sikarugir](https://github.com/Sikarugir-App/Creator) (formerly Kegworks). See [WUKIYO_PATCHES.md](WUKIYO_PATCHES.md) for the responsibility boundary and patch classification.
 
 ## Patches
 
@@ -82,7 +82,7 @@ D3DMetal (Apple GPTK) covers D3D11/D3D12/DXGI/DDraw but **not** D3D9; d9vk remai
 ## Related
 
 - [Wukiyo](https://github.com/tsukasa-art/Wukiyo) — macOS launcher and HUD that drives the thumbnail injection
-- [Sikarugir](https://github.com/Sikarugir-App/Creator) — macOS Wine lineage that inspired this work (credit only; no source delta carried here — base is WineHQ 10.0)
+- [Sikarugir](https://github.com/Sikarugir-App/Creator) — macOS Wine work that inspired this project
 - [Zenn: Mac で美少女ゲームを動かす](https://zenn.dev/tsukasa_art/articles/mac-eroge-compat-part1) — series documenting the compatibility work
 
 ---
