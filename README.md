@@ -1,36 +1,41 @@
 # wine-wukiyo
 
-A personal patch set forked from [Sikarugir-App/wine](https://github.com/Sikarugir-App/wine) (Wine 10.0, LGPL), targeting macOS (Apple Silicon / Rosetta 2). Built for use with the [Wukiyo](https://github.com/tsukasa-art/Wukiyo) launcher.
+A personal Wine fork targeting macOS (Apple Silicon / Rosetta 2), built for use with the [Wukiyo](https://github.com/tsukasa-art/Wukiyo) launcher. The git base is the **vanilla [WineHQ](https://gitlab.winehq.org/wine/wine) Wine 10.0 release** (`b0738596` "Release 10.0."); all macOS/Rosetta compatibility work is carried by this fork's own patches. This repository is the source of truth for Wukiyo's bundled Wine runtime, and WineHQ is the upstream to rebase onto.
 
-[Wine](https://gitlab.winehq.org/wine/wine) is the foundation that makes all of this possible. [Sikarugir](https://github.com/Sikarugir-App/Creator) (formerly Kegworks) maintains the macOS-specific Wine fork this repo is based on — both projects do the heavy lifting; this repo only adds the two hooks described below. The built Wine binary is bundled inside [Wukiyo.app](https://github.com/tsukasa-art/Wukiyo) under `Contents/Resources/wine-support/` and driven directly by the Swift launcher.
+[Sikarugir](https://github.com/Sikarugir-App/Creator) (formerly Kegworks) is the macOS Wine lineage this project was originally inspired by, but it is **credit/lineage only** — the measured source delta over WineHQ 10.0 in this repo is zero (no Sikarugir commits are carried here; the macOS-critical fixes such as the Rosetta far-call thunks and the binutils delay-load fix are this fork's own). Wukiyo must ship binaries that trace back to this fork and to the runtime manifest in the launcher repository. See [WUKIYO_PATCHES.md](WUKIYO_PATCHES.md) for the responsibility boundary and patch classification.
 
 ## Patches
 
-### `winemac.drv` — Metal window capture (`macdrv_GetImage`)
+### Core runtime patches
 
-Adds `macdrv_GetImage` to `winemac.drv` so that `GetDIBits`/`BitBlt` can read back pixels from Metal-rendered windows. Without this, GDI-based screen capture returns black because Wine's GDI layer and macOS Metal are fully separated rendering stacks.
+The supported Wukiyo runtime carries macOS/Rosetta compatibility work in
+`wow64cpu`, `ntdll`, `win32u`, and `winemac.drv`. These are not launcher
+features; they are Wine behavior fixes and belong in this fork.
 
-**Affected files**: `dlls/winemac.drv/`
+### `d3d9` / `wined3d` — CMVS thumbnail capture
 
-### `d3d9` — Save-screen thumbnail injection (`wukiyo-thumbnail-injection` branch)
+CMVS save/load thumbnails are gated by `WUKIYO_CMVS_THUMBS` and must remain
+default-off for non-CMVS engines.
 
-Hooks into the D3D9 `LockRect` / `UnlockRect` cycle of save-screen surfaces (192×108) to inject per-slot screenshots captured by Wukiyo.
+The current mechanism serves the last-presented frame to back-buffer
+`LockRect(READONLY)` calls and uses Wukiyo-provided snapshot files only through
+the documented launcher/Wine IPC contract.
 
-How it works:
+Snap file format:
 
-1. Wukiyo captures the game window via ScreenCaptureKit and writes `/tmp/wukiyo_snap_NNN.bgra` at save time (also mirrored to `~/.wukiyo_snaps/` as a persistent fallback).
-2. `surface.c` detects 192×108 `LockRect` calls, reads `/tmp/wukiyo_page_base.txt` to compute the target slot, and blits the BGRA snap over the game's write after `UnlockRect`.
+```text
+[u32 width][u32 height][u32 stride] + BGRA pixels (top-down)
+```
 
-Snap file format: `[u32 width][u32 height][u32 stride] + BGRA pixels (top-down)`.
-
-**Affected files**: `dlls/d3d9/surface.c`, `dlls/d3d9/device.c`
+**Affected files**: `dlls/d3d9/*`, `dlls/wined3d/swapchain.c`
 
 ## Branches
 
 | Branch | Base | Contents |
 |---|---|---|
-| `master` | Wine 11.x | `macdrv_GetImage` patch |
-| `wukiyo-thumbnail-injection` | Wine 10.0 | `master` + D3D9 thumbnail injection |
+| `master` | WineHQ Wine 10.0 release | **canonical** — supported Wukiyo Wine patch set (Wine fork convention; no `main`) |
+| `wukiyo-thumbnail-injection` | WineHQ Wine 10.0 | current Phase 0 source baseline before the canonical `master` cutover |
+| `softdenchi-*` | topic only | experimental/post-v1 work, not bundled unless promoted |
 
 ## Build (macOS / Rosetta 2)
 
@@ -77,7 +82,7 @@ D3DMetal (Apple GPTK) covers D3D11/D3D12/DXGI/DDraw but **not** D3D9; d9vk remai
 ## Related
 
 - [Wukiyo](https://github.com/tsukasa-art/Wukiyo) — macOS launcher and HUD that drives the thumbnail injection
-- [Sikarugir](https://github.com/Sikarugir-App/Creator) — macOS Wine fork this repo is based on
+- [Sikarugir](https://github.com/Sikarugir-App/Creator) — macOS Wine lineage that inspired this work (credit only; no source delta carried here — base is WineHQ 10.0)
 - [Zenn: Mac で美少女ゲームを動かす](https://zenn.dev/tsukasa_art/articles/mac-eroge-compat-part1) — series documenting the compatibility work
 
 ---
