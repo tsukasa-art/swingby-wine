@@ -33,7 +33,7 @@ third-party wrappers.
 
 Target policy:
 
-- Public default / canonical branch: `master` (Wine fork convention; `main` は作らない).
+- Public default / canonical branch: `master` (Wine fork convention; no `main` branch).
 - `master` contains Wukiyo's supported Wine patch set.
 - Phase 0 authority is the runtime content currently used by the Wukiyo
   launcher, not an existing branch name or version string.
