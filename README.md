@@ -34,8 +34,8 @@ Snap file format:
 | Branch | Base | Contents |
 |---|---|---|
 | `master` | WineHQ Wine 10.0 release | **canonical** — supported Wukiyo Wine patch set (Wine fork convention; no `main`) |
-| `wukiyo-thumbnail-injection` | WineHQ Wine 10.0 | current Phase 0 source baseline before the canonical `master` cutover |
-| `softdenchi-*` | topic only | experimental/post-v1 work, not bundled unless promoted |
+| `softdenchi-wts-session` | `master` | experimental/post-v1 (SoftDenchi WTS / crypt32). Not bundled unless promoted |
+| `backup/pre-purge-master-*` | — | historical reference (pre-rehab master snapshot) |
 
 ## Build (macOS / Rosetta 2)
 
@@ -55,7 +55,7 @@ Produces x86_64 binaries that run under Rosetta 2.
 
 ## Deploy into Wukiyo
 
-The built `.so` files replace their counterparts inside `Wukiyo.app/Contents/Resources/wine-support/`. ABI must match — build from Wine 10.0 (the `wukiyo-thumbnail-injection` branch base).
+The built `.so` files replace their counterparts inside `Wukiyo.app/Contents/Resources/wine-support/`. ABI must match — build from the `master` branch (WineHQ Wine 10.0 base).
 
 ```bash
 WINE_LIB=~/Applications/Wukiyo.app/Contents/Resources/wine-support/wine/lib/wine/x86_64-unix
