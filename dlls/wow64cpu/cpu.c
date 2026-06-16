@@ -70,7 +70,7 @@ struct rosetta_thunk_opcodes
 static BYTE DECLSPEC_ALIGN(4096) code_buffer[0x1000];
 
 /* referenced from inline asm, hence not static */
-int wukiyo_is_rosetta = 0;
+int swingby_is_rosetta = 0;
 
 static USHORT cs64_sel;
 static USHORT ds64_sel;
@@ -229,7 +229,7 @@ __ASM_GLOBAL_FUNC( syscall_32to64,
                    "movl %edx,4(%rsp)\n\t"
                    "movl 0xc4(%r13),%r14d\n\t"  /* context->Esp */
                    "xchgq %r14,%rsp\n\t"
-                   "cmpl $0,wukiyo_is_rosetta(%rip)\n\t"
+                   "cmpl $0,swingby_is_rosetta(%rip)\n\t"
                    "jne 1f\n\t"
                    "ljmp *(%r14)\n"
                    "1:\tsubq $0x10,%rsp\n\t"     /* Rosetta: far return instead of far jmp */
@@ -294,7 +294,7 @@ __ASM_GLOBAL_FUNC( unix_call_32to64,
                    "movl %edx,4(%rsp)\n\t"
                    "movl 0xc4(%r13),%r14d\n\t"  /* context->Esp */
                    "xchgq %r14,%rsp\n\t"
-                   "cmpl $0,wukiyo_is_rosetta(%rip)\n\t"
+                   "cmpl $0,swingby_is_rosetta(%rip)\n\t"
                    "jne 1f\n\t"
                    "ljmp *(%r14)\n"
                    "1:\tsubq $0x10,%rsp\n\t"     /* Rosetta: far return instead of far jmp */
@@ -361,10 +361,10 @@ NTSTATUS WINAPI BTCpuProcessInit(void)
         char brand[0x40];
 
         if (!NtQuerySystemInformation( SystemProcessorBrandString, brand, sizeof(brand), NULL ))
-            wukiyo_is_rosetta = strstr( brand, "VirtualApple" ) != NULL;
+            swingby_is_rosetta = strstr( brand, "VirtualApple" ) != NULL;
     }
 
-    if (wukiyo_is_rosetta)
+    if (swingby_is_rosetta)
     {
         static const BYTE code64[] = { 0x83, 0xc4, 0x08,                    /* add $8,%esp (discard far-call frame) */
                                        0xff, 0x25, 0x00, 0x00, 0x00, 0x00   /* jmp *0(%rip) -> target */ };
@@ -413,7 +413,7 @@ NTSTATUS WINAPI BTCpuProcessInit(void)
  */
 void * WINAPI BTCpuGetBopCode(void)
 {
-    if (wukiyo_is_rosetta)
+    if (swingby_is_rosetta)
         return &((struct rosetta_thunk_opcodes *)code_buffer)->syscall_thunk;
     return &((struct thunk_opcodes *)code_buffer)->syscall_thunk;
 }
@@ -424,7 +424,7 @@ void * WINAPI BTCpuGetBopCode(void)
  */
 void * WINAPI __wine_get_unix_opcode(void)
 {
-    if (wukiyo_is_rosetta)
+    if (swingby_is_rosetta)
         return &((struct rosetta_thunk_opcodes *)code_buffer)->unix_thunk;
     return &((struct thunk_opcodes *)code_buffer)->unix_thunk;
 }

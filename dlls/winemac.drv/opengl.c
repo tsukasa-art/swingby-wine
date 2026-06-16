@@ -4432,10 +4432,10 @@ void wine_capture_window_pixels_bgra(
 
     if (!buf || !w || !h) return;
 
-    /* Try Wukiyo snapshot file first (ScreenCaptureKit, accurate Metal content). */
+    /* Try Melammu snapshot file first (ScreenCaptureKit, accurate Metal content). */
     {
         int ok = 0;
-        FILE *f = fopen("/tmp/wukiyo_snap.bgra", "rb");
+        FILE *f = fopen("/tmp/melammu_snap.bgra", "rb");
         if (f)
         {
             uint32_t fw = 0, fh = 0, fstride = 0;

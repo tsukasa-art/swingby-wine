@@ -27,17 +27,17 @@
 WINE_DEFAULT_DEBUG_CHANNEL(d3d);
 WINE_DECLARE_DEBUG_CHANNEL(d3d_perf);
 
-/* Master gate for Wukiyo's CMVS save-thumbnail capture (the per-present CG
+/* Master gate for Melammu's CMVS save-thumbnail capture (the per-present CG
  * window readback into front-buffer SYSMEM).  Default OFF so the present path
  * is stock wine for non-CMVS engines (no per-frame CG capture overhead).  The
- * launcher sets WUKIYO_CMVS_THUMBS=1 only for the CMVS EngineProfile; this
+ * launcher sets MELAMMU_CMVS_THUMBS=1 only for the CMVS EngineProfile; this
  * mirrors the same gate in d3d9/device.c. */
-static BOOL wukiyo_capture_enabled(void)
+static BOOL swingby_capture_enabled(void)
 {
     static int cached = -1;
     if (cached < 0)
     {
-        const char *e = getenv("WUKIYO_CMVS_THUMBS");
+        const char *e = getenv("MELAMMU_CMVS_THUMBS");
         cached = (e && e[0] && e[0] != '0') ? 1 : 0;
     }
     return cached;
@@ -262,7 +262,7 @@ HRESULT CDECL wined3d_swapchain_get_front_buffer_data(const struct wined3d_swapc
     /* On Metal-backed OpenGL, GL readback always returns black. Do an on-demand
      * CG screen capture right now (before any save menu appears) so we get the
      * actual composited game scene, then write it directly to dst SYSMEM. */
-    if (wukiyo_capture_enabled())
+    if (swingby_capture_enabled())
     {
         typedef void (WINAPI *CAPTURE_FN)(HWND, void *, unsigned int, unsigned int, unsigned int);
         static CAPTURE_FN cg_capture = (CAPTURE_FN)(intptr_t)-1;
@@ -1032,10 +1032,10 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
         /* CG capture: use winemac.drv PE export to reach the Core Graphics capture path.
          * Writes directly into the front buffer's SYSMEM so GetFrontBufferData can
          * serve it without any GPU readback (which returns black on Metal).
-         * Gated: only for CMVS (WUKIYO_CMVS_THUMBS=1); skipped otherwise so the
+         * Gated: only for CMVS (MELAMMU_CMVS_THUMBS=1); skipped otherwise so the
          * present path carries no per-frame CG readback overhead. */
         cg_captured = FALSE;
-        if (wukiyo_capture_enabled())
+        if (swingby_capture_enabled())
         {
             typedef void (WINAPI *CAPTURE_FN)(HWND hwnd, void *buf,
                     unsigned int w, unsigned int h, unsigned int row_pitch);
@@ -1800,7 +1800,7 @@ static void swapchain_gdi_present(struct wined3d_swapchain *swapchain,
      * front buffer SYSMEM location valid so that GetFrontBufferData can
      * read it directly without the blt system re-filling it with black.
      * CMVS-only; stock wine leaves the front buffer SYSMEM invalid here. */
-    if (wukiyo_capture_enabled())
+    if (swingby_capture_enabled())
         wined3d_texture_validate_location(swapchain->front_buffer, 0, WINED3D_LOCATION_SYSMEM);
 
     SetRect(&swapchain->front_buffer_update, 0, 0,

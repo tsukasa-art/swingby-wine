@@ -167,7 +167,7 @@ static HRESULT WINAPI d3d9_swapchain_GetFrontBufferData(IDirect3DSwapChain9Ex *i
     hr = wined3d_swapchain_get_front_buffer_data(swapchain->wined3d_swapchain, dst->wined3d_texture, dst->sub_resource_idx);
     wined3d_mutex_unlock();
 
-    /* Wukiyo: CG compositor path returns full macOS desktop; overwrite with game-frame snap. */
+    /* Melammu: CG compositor path returns full macOS desktop; overwrite with game-frame snap. */
     if (SUCCEEDED(hr))
     {
         D3DLOCKED_RECT lr;
@@ -176,7 +176,7 @@ static HRESULT WINAPI d3d9_swapchain_GetFrontBufferData(IDirect3DSwapChain9Ex *i
             wined3d_mutex_lock();
             wined3d_texture_get_sub_resource_desc(dst->wined3d_texture, dst->sub_resource_idx, &desc);
             wined3d_mutex_unlock();
-            { FILE *snap_f = fopen("Z:\\tmp\\wukiyo_snap.bgra", "rb");
+            { FILE *snap_f = fopen("Z:\\tmp\\melammu_snap.bgra", "rb");
               if (snap_f) {
                 UINT row_bytes = desc.width * 4; UINT y;
                 for (y = 0; y < desc.height; y++) {
@@ -184,7 +184,7 @@ static HRESULT WINAPI d3d9_swapchain_GetFrontBufferData(IDirect3DSwapChain9Ex *i
                     if (fread(dst_row, 1, row_bytes, snap_f) < row_bytes) break;
                 }
                 fclose(snap_f);
-                { FILE *lg = fopen("Z:\\tmp\\wukiyo_stretch.txt","a");
+                { FILE *lg = fopen("Z:\\tmp\\swingby_stretch.txt","a");
                   if (lg){fprintf(lg,"SwapChainGetFrontBuf intercepted %ux%u\n",desc.width,desc.height);fclose(lg);} }
               }
             }

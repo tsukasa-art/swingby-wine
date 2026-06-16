@@ -1,24 +1,24 @@
-# wine-wukiyo
+# swingby-wine
 
-A personal Wine fork targeting macOS (Apple Silicon / Rosetta 2), built for use with the [Wukiyo](https://github.com/tsukasa-art/Wukiyo) launcher. Based on the [WineHQ](https://gitlab.winehq.org/wine/wine) **Wine 10.0 release** (`b0738596`), it carries this fork's own macOS/Rosetta compatibility patches. This repository is the source of truth for Wukiyo's bundled Wine runtime; WineHQ is the upstream to rebase onto.
+A personal Wine fork targeting macOS (Apple Silicon / Rosetta 2), built for use with the [Melammu](https://github.com/tsukasa-art/Wukiyo) launcher. Based on the [WineHQ](https://gitlab.winehq.org/wine/wine) **Wine 10.0 release** (`b0738596`), it carries this fork's own macOS/Rosetta compatibility patches. This repository is the source of truth for Melammu's bundled Wine runtime; WineHQ is the upstream to rebase onto.
 
-Inspired by the macOS Wine work of [Sikarugir](https://github.com/Sikarugir-App/Creator) (formerly Kegworks). See [WUKIYO_PATCHES.md](WUKIYO_PATCHES.md) for the responsibility boundary and patch classification.
+Inspired by the macOS Wine work of [Sikarugir](https://github.com/Sikarugir-App/Creator) (formerly Kegworks). See [SWINGBY_PATCHES.md](SWINGBY_PATCHES.md) for the responsibility boundary and patch classification.
 
 ## Patches
 
 ### Core runtime patches
 
-The supported Wukiyo runtime carries macOS/Rosetta compatibility work in
+The supported Melammu runtime carries macOS/Rosetta compatibility work in
 `wow64cpu`, `ntdll`, `win32u`, and `winemac.drv`. These are not launcher
 features; they are Wine behavior fixes and belong in this fork.
 
 ### `d3d9` / `wined3d` — CMVS thumbnail capture
 
-CMVS save/load thumbnails are gated by `WUKIYO_CMVS_THUMBS` and must remain
+CMVS save/load thumbnails are gated by `MELAMMU_CMVS_THUMBS` and must remain
 default-off for non-CMVS engines.
 
 The current mechanism serves the last-presented frame to back-buffer
-`LockRect(READONLY)` calls and uses Wukiyo-provided snapshot files only through
+`LockRect(READONLY)` calls and uses Melammu-provided snapshot files only through
 the documented launcher/Wine IPC contract.
 
 Snap file format:
@@ -33,7 +33,7 @@ Snap file format:
 
 | Branch | Base | Contents |
 |---|---|---|
-| `master` | WineHQ Wine 10.0 release | **canonical** — supported Wukiyo Wine patch set (Wine fork convention; no `main`) |
+| `master` | WineHQ Wine 10.0 release | **canonical** — supported Melammu Wine patch set (Wine fork convention; no `main`) |
 | `softdenchi-wts-session` | `master` | experimental/post-v1 (SoftDenchi WTS / crypt32). Not bundled unless promoted |
 | `backup/pre-purge-master-*` | — | historical reference (pre-rehab master snapshot) |
 
@@ -53,12 +53,12 @@ arch -x86_64 make -s -j$(sysctl -n hw.activecpu)
 
 Produces x86_64 binaries that run under Rosetta 2.
 
-## Deploy into Wukiyo
+## Deploy into Melammu
 
-The built `.so` files replace their counterparts inside `Wukiyo.app/Contents/Resources/wine-support/`. ABI must match — build from the `master` branch (WineHQ Wine 10.0 base).
+The built `.so` files replace their counterparts inside `Melammu.app/Contents/Resources/wine-support/`. ABI must match — build from the `master` branch (WineHQ Wine 10.0 base).
 
 ```bash
-WINE_LIB=~/Applications/Wukiyo.app/Contents/Resources/wine-support/wine/lib/wine/x86_64-unix
+WINE_LIB=~/Applications/Melammu.app/Contents/Resources/wine-support/wine/lib/wine/x86_64-unix
 
 # winemac patch
 cp build/dlls/winemac.drv/winemac.so "$WINE_LIB/winemac.so"
@@ -69,19 +69,19 @@ cp build/dlls/d3d9/d3d9.dll.so "$WINE_LIB/d3d9.dll.so"
 codesign --force --sign - "$WINE_LIB/d3d9.dll.so"
 ```
 
-Alternatively, use the `deploy.sh` / `deploy_d3d9.sh` scripts in the Wukiyo repo which handle paths and re-signing automatically.
+Alternatively, use the `deploy.sh` / `deploy_d3d9.sh` scripts in the Melammu repo which handle paths and re-signing automatically.
 
-**Note on notarization**: Ad-hoc re-signing (`-`) is sufficient for running on your own Mac (with Terminal listed under Privacy & Security → Developer Tools). Distribution requires a Developer ID certificate and full re-notarization of Wukiyo.app.
+**Note on notarization**: Ad-hoc re-signing (`-`) is sufficient for running on your own Mac (with Terminal listed under Privacy & Security → Developer Tools). Distribution requires a Developer ID certificate and full re-notarization of Melammu.app.
 
 ## Notes on D3D9
 
-For D3D9 games (KiriKiriZ, etc.), [d9vk](https://github.com/Joshua-Ashton/d9vk) (D3D9→Vulkan→MoltenVK→Metal) is recommended over Wine's built-in wined3d. Wukiyo bundles d9vk and writes `drive_c/dxvk.conf` with `d3d9.presentInterval = 1` at install time to force vsync — without this, KiriKiriZ engines write `waitvsync=no` to their `.cfu` config on first run, causing flickering on Wine+Metal.
+For D3D9 games (KiriKiriZ, etc.), [d9vk](https://github.com/Joshua-Ashton/d9vk) (D3D9→Vulkan→MoltenVK→Metal) is recommended over Wine's built-in wined3d. Melammu bundles d9vk and writes `drive_c/dxvk.conf` with `d3d9.presentInterval = 1` at install time to force vsync — without this, KiriKiriZ engines write `waitvsync=no` to their `.cfu` config on first run, causing flickering on Wine+Metal.
 
 D3DMetal (Apple GPTK) covers D3D11/D3D12/DXGI/DDraw but **not** D3D9; d9vk remains the correct path for D3D9 titles.
 
 ## Related
 
-- [Wukiyo](https://github.com/tsukasa-art/Wukiyo) — macOS launcher and HUD that drives the thumbnail injection
+- [Melammu](https://github.com/tsukasa-art/Wukiyo) — macOS launcher and HUD that drives the thumbnail injection
 - [Sikarugir](https://github.com/Sikarugir-App/Creator) — macOS Wine work that inspired this project
 - [Zenn: Mac で美少女ゲームを動かす](https://zenn.dev/tsukasa_art/articles/mac-eroge-compat-part1) — series documenting the compatibility work
 

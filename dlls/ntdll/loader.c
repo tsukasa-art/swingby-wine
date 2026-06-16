@@ -3738,7 +3738,7 @@ BOOLEAN WINAPI RtlDllShutdownInProgress(void)
  * read-only section (.idata): binutils >= 2.43 emits the delay IAT read-only
  * (ld bug 32675), so make the page temporarily writable like the Windows
  * delayimp helper does. */
-static void wukiyo_write_delay_slot( ULONG_PTR *dest, ULONG_PTR value )
+static void swingby_write_delay_slot( ULONG_PTR *dest, ULONG_PTR value )
 {
     void *page = dest;
     SIZE_T size = sizeof(*dest);
@@ -3789,7 +3789,7 @@ void* WINAPI LdrResolveDelayLoadedAPI( void* base, const IMAGE_DELAYLOAD_DESCRIP
         nts = LdrLoadDll(NULL, 0, &mod, &hmod);
         RtlFreeUnicodeString(&mod);
         if (nts) goto fail;
-        wukiyo_write_delay_slot( (ULONG_PTR *)phmod, (ULONG_PTR)hmod );
+        swingby_write_delay_slot( (ULONG_PTR *)phmod, (ULONG_PTR)hmod );
     }
 
     if (IMAGE_SNAP_BY_ORDINAL(pINT[id].u1.Ordinal))
@@ -3804,7 +3804,7 @@ void* WINAPI LdrResolveDelayLoadedAPI( void* base, const IMAGE_DELAYLOAD_DESCRIP
     }
     if (!nts)
     {
-        wukiyo_write_delay_slot( &pIAT[id].u1.Function, (ULONG_PTR)fp );
+        swingby_write_delay_slot( &pIAT[id].u1.Function, (ULONG_PTR)fp );
         return fp;
     }
 

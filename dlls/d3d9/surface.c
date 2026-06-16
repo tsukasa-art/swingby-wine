@@ -234,30 +234,30 @@ static HRESULT WINAPI d3d9_surface_GetDesc(IDirect3DSurface9 *iface, D3DSURFACE_
     return D3D_OK;
 }
 
-/* ---------- Wukiyo per-slot thumbnail injection ----------
+/* ---------- Melammu per-slot thumbnail injection ----------
  *
  * CatSystem2 (CMVS64) calls StretchRect(backbuffer → 192×108 RT) then LockRect(0x800)
  * once for EACH visible save slot when the save/load screen renders.  By counting
  * StretchRect events we can determine which slot is being rendered and inject the
  * screenshot that was taken at that slot's save time.
  *
- * Communication files (all written by Wukiyo on macOS side):
- *   /tmp/wukiyo_snap.bgra          – fallback: most recent screenshot (persistent)
- *   /tmp/wukiyo_snap_NNN.bgra      – per-slot snap for slot NNN (written at save time)
- *   /tmp/wukiyo_page_base.txt      – first slot number of the current save-screen page
- *   /tmp/wukiyo_inject_dat_path.txt – Windows path to the .dat file just saved
+ * Communication files (all written by Melammu on macOS side):
+ *   /tmp/melammu_snap.bgra          – fallback: most recent screenshot (persistent)
+ *   /tmp/melammu_snap_NNN.bgra      – per-slot snap for slot NNN (written at save time)
+ *   /tmp/melammu_page_base.txt      – first slot number of the current save-screen page
+ *   /tmp/melammu_inject_dat_path.txt – Windows path to the .dat file just saved
  */
 
 /* Shared with device.c: pauses auto-capture while save screen is open. */
-extern UINT wukiyo_save_screen_cooldown;
-extern DWORD wukiyo_snap_tick;
-extern DWORD wukiyo_rt_snap_tick;
-extern BOOL wukiyo_rt_capture_active;
-extern BOOL wukiyo_observe_only;
-extern BOOL wukiyo_capture_is_enabled(void);
-extern void wukiyo_diag(const char *fmt, ...);
+extern UINT swingby_save_screen_cooldown;
+extern DWORD melammu_snap_tick;
+extern DWORD swingby_rt_snap_tick;
+extern BOOL swingby_rt_capture_active;
+extern BOOL swingby_observe_only;
+extern BOOL swingby_capture_is_enabled(void);
+extern void swingby_diag(const char *fmt, ...);
 
-static void wukiyo_free_pix_cache(void); /* forward declaration */
+static void swingby_free_pix_cache(void); /* forward declaration */
 
 /* Simple pixel cache shared across all inject calls for a given snap file. */
 static struct {
@@ -267,13 +267,13 @@ static struct {
 } s_pix_cache;
 
 /* Registry: maps 192x108 surface ifaces → 0-indexed file slot numbers. */
-#define WUKIYO_MAX_SLOTS 18
-static struct { IDirect3DSurface9 *iface; unsigned int slot; } s_reg[WUKIYO_MAX_SLOTS];
+#define SWINGBY_MAX_SLOTS 18
+static struct { IDirect3DSurface9 *iface; unsigned int slot; } s_reg[SWINGBY_MAX_SLOTS];
 static unsigned int s_reg_count     = 0;
 static unsigned int s_reg_page_base = (unsigned int)-1; /* sentinel: unset */
 static DWORD        s_reg_last_tick = 0;
 
-static unsigned int wukiyo_registry_slot(IDirect3DSurface9 *iface)
+static unsigned int swingby_registry_slot(IDirect3DSurface9 *iface)
 {
     DWORD now = GetTickCount();
     unsigned int i, page_base;
@@ -283,13 +283,13 @@ static unsigned int wukiyo_registry_slot(IDirect3DSurface9 *iface)
     if (s_reg_count > 0 && (DWORD)(now - s_reg_last_tick) > 1000) {
         s_reg_count = 0;
         s_reg_page_base = (unsigned int)-1;
-        wukiyo_free_pix_cache();
+        swingby_free_pix_cache();
     }
     s_reg_last_tick = now;
 
     if (s_reg_page_base == (unsigned int)-1) {
         page_base = 0;
-        f = fopen("Z:\\tmp\\wukiyo_page_base.txt", "rb");
+        f = fopen("Z:\\tmp\\melammu_page_base.txt", "rb");
         if (f) { fscanf(f, "%u", &page_base); fclose(f); }
         s_reg_page_base = page_base;
     }
@@ -297,7 +297,7 @@ static unsigned int wukiyo_registry_slot(IDirect3DSurface9 *iface)
     for (i = 0; i < s_reg_count; i++)
         if (s_reg[i].iface == iface) return s_reg[i].slot;
 
-    if (s_reg_count < WUKIYO_MAX_SLOTS) {
+    if (s_reg_count < SWINGBY_MAX_SLOTS) {
         unsigned int slot = s_reg_page_base + s_reg_count;
         s_reg[s_reg_count].iface = iface;
         s_reg[s_reg_count].slot  = slot;
@@ -307,7 +307,7 @@ static unsigned int wukiyo_registry_slot(IDirect3DSurface9 *iface)
     return (unsigned int)-1;
 }
 
-static void wukiyo_free_pix_cache(void)
+static void swingby_free_pix_cache(void)
 {
     if (s_pix_cache.pixels) {
         HeapFree(GetProcessHeap(), 0, s_pix_cache.pixels);
@@ -318,7 +318,7 @@ static void wukiyo_free_pix_cache(void)
 
 /* Load pixels from a snap file.  Returns FALSE on failure.
  * Caches the last loaded file to avoid redundant reads for the same slot. */
-static BOOL wukiyo_load_snap_file(const char *path,
+static BOOL swingby_load_snap_file(const char *path,
     BYTE **out_px, unsigned int *out_fw, unsigned int *out_fh, unsigned int *out_fstride)
 {
     unsigned int fw = 0, fh = 0, fstride = 0;
@@ -344,7 +344,7 @@ static BOOL wukiyo_load_snap_file(const char *path,
     { HeapFree(GetProcessHeap(), 0, px); fclose(f); return FALSE; }
     fclose(f);
 
-    wukiyo_free_pix_cache();
+    swingby_free_pix_cache();
     s_pix_cache.pixels  = px;
     s_pix_cache.fw      = fw;
     s_pix_cache.fh      = fh;
@@ -357,7 +357,7 @@ static BOOL wukiyo_load_snap_file(const char *path,
 }
 
 /* Blit pixels (top-down) into the locked surface buffer (bottom-up readback). */
-static void wukiyo_blit(void *dst_data, unsigned int dst_pitch,
+static void swingby_blit(void *dst_data, unsigned int dst_pitch,
     const BYTE *src_px, unsigned int src_fw, unsigned int src_fh, unsigned int src_fstride)
 {
     unsigned int dy, dx;
@@ -387,17 +387,17 @@ static unsigned int        s_rtdata_serial = 0;
 static BOOL                s_rtdata_lock_logged = FALSE;
 
 /* Called from device.c on every StretchRect to a 192x108 destination. */
-void wukiyo_on_stretchrect(IDirect3DSurface9 *dest)
+void swingby_on_stretchrect(IDirect3DSurface9 *dest)
 {
     s_inject_pending_surf = dest;
     s_inject_pending_tick = GetTickCount();
-    wukiyo_free_pix_cache(); /* Fresh snap was just written; invalidate stale cache. */
-    { FILE *lg = fopen("Z:\\tmp\\wukiyo_trace.txt","a");
+    swingby_free_pix_cache(); /* Fresh snap was just written; invalidate stale cache. */
+    { FILE *lg = fopen("Z:\\tmp\\melammu_trace.txt","a");
       if (lg) { fprintf(lg,"stretchrect dest=%p\n",(void*)dest); fclose(lg); } }
 }
 
 /* Called from device.c after GetRenderTargetData has copied render_target -> dst. */
-void wukiyo_on_get_render_target_data(IDirect3DSurface9 *src, IDirect3DSurface9 *dst)
+void swingby_on_get_render_target_data(IDirect3DSurface9 *src, IDirect3DSurface9 *dst)
 {
     s_inject_pending_surf = dst;
     s_inject_pending_tick = GetTickCount();
@@ -406,38 +406,38 @@ void wukiyo_on_get_render_target_data(IDirect3DSurface9 *src, IDirect3DSurface9 
     s_rtdata_tick = s_inject_pending_tick;
     s_rtdata_serial++;
     s_rtdata_lock_logged = FALSE;
-    { FILE *lg = fopen("Z:\\tmp\\wukiyo_trace.txt","a");
+    { FILE *lg = fopen("Z:\\tmp\\melammu_trace.txt","a");
       if (lg) { fprintf(lg,"getrtdata_set serial=%u src=%p dst=%p\n",
           s_rtdata_serial,(void*)src,(void*)dst); fclose(lg); } }
 }
 
-/* Inject the per-slot snap (wukiyo_snap_NNN.bgra) into the locked surface buffer.
- * Tries /tmp first (live session), then ~/Library/Application Support/Wukiyo/snaps/
+/* Inject the per-slot snap (melammu_snap_NNN.bgra) into the locked surface buffer.
+ * Tries /tmp first (live session), then ~/Library/Application Support/Melammu/snaps/
  * for persistence across reboots.
  * Returns 1 if a snap was found and blitted, 0 otherwise. */
-static int wukiyo_inject_snap_slot(void *data, unsigned int row_pitch, int slot)
+static int swingby_inject_snap_slot(void *data, unsigned int row_pitch, int slot)
 {
     char         path[512];
     BYTE        *px = NULL;
     unsigned int fw, fh, fstride;
 
     /* 1. Try per-slot snap in /tmp (written by Swift periodic capture). */
-    snprintf(path, sizeof(path), "Z:\\tmp\\wukiyo_snap_%03d.bgra", slot);
-    if (wukiyo_load_snap_file(path, &px, &fw, &fh, &fstride))
+    snprintf(path, sizeof(path), "Z:\\tmp\\melammu_snap_%03d.bgra", slot);
+    if (swingby_load_snap_file(path, &px, &fw, &fh, &fstride))
     {
-        wukiyo_blit(data, row_pitch, px, fw, fh, fstride);
+        swingby_blit(data, row_pitch, px, fw, fh, fstride);
         return 1;
     }
 
-    /* 2. Persistent per-slot path (~/.wukiyo_snaps/). */
+    /* 2. Persistent per-slot path (~/.melammu_snaps/). */
     {
         const char *home = getenv("HOME");
         if (home)
         {
-            snprintf(path, sizeof(path), "%s/.wukiyo_snaps/wukiyo_snap_%03d.bgra", home, slot);
-            if (wukiyo_load_snap_file(path, &px, &fw, &fh, &fstride))
+            snprintf(path, sizeof(path), "%s/.melammu_snaps/melammu_snap_%03d.bgra", home, slot);
+            if (swingby_load_snap_file(path, &px, &fw, &fh, &fstride))
             {
-                wukiyo_blit(data, row_pitch, px, fw, fh, fstride);
+                swingby_blit(data, row_pitch, px, fw, fh, fstride);
                 return 1;
             }
         }
@@ -450,20 +450,20 @@ static int wukiyo_inject_snap_slot(void *data, unsigned int row_pitch, int slot)
  * Called after inject fires.  Builds a 192x108 24-bpp bottom-up BMP from the
  * per-slot BGRA snap, LZSS-compresses it (all-literal mode), and rewrites
  * blob 1 of the CSV2 save container.  The .dat Windows path is read from
- * wukiyo_inject_dat_path.txt.  Format details: re/FINDINGS.md.
+ * melammu_inject_dat_path.txt.  Format details: re/FINDINGS.md.
  *
  * The patch runs on a worker thread (CreateThread) — render-thread hooks
  * must never block on file I/O.
  */
 
-#define WUKIYO_BMP_W           192
-#define WUKIYO_BMP_H           108
-#define WUKIYO_BMP_PIX_BYTES   (WUKIYO_BMP_W * WUKIYO_BMP_H * 3)   /* 62208 */
-#define WUKIYO_BMP_TOTAL_BYTES (54 + WUKIYO_BMP_PIX_BYTES)         /* 62262 */
+#define SWINGBY_BMP_W           192
+#define SWINGBY_BMP_H           108
+#define SWINGBY_BMP_PIX_BYTES   (SWINGBY_BMP_W * SWINGBY_BMP_H * 3)   /* 62208 */
+#define SWINGBY_BMP_TOTAL_BYTES (54 + SWINGBY_BMP_PIX_BYTES)         /* 62262 */
 
 /* LZSS all-literal encoder (same ring-buffer variant as FUN_140068210).
  * Flag byte with n bits set followed by n literal bytes; ~12% overhead. */
-static unsigned char *wukiyo_lzss_all_literal(const unsigned char *src,
+static unsigned char *swingby_lzss_all_literal(const unsigned char *src,
                                               size_t src_len, size_t *out_len)
 {
     size_t cap = src_len + (src_len / 8) + 8;
@@ -484,7 +484,7 @@ static unsigned char *wukiyo_lzss_all_literal(const unsigned char *src,
 }
 
 /* Standalone BGRA snap loader (no shared cache — worker-thread safe). */
-static BOOL wukiyo_load_snap_uncached(const char *path,
+static BOOL swingby_load_snap_uncached(const char *path,
     BYTE **out_px, unsigned int *out_fw, unsigned int *out_fh, unsigned int *out_fstride)
 {
     unsigned int fw = 0, fh = 0, fstride = 0;
@@ -507,9 +507,9 @@ static BOOL wukiyo_load_snap_uncached(const char *path,
     return TRUE;
 }
 
-static void wukiyo_patch_dat_file_impl(int slot)
+static void swingby_patch_dat_file_impl(int slot)
 {
-    static const char dat_key_path[] = "Z:\\tmp\\wukiyo_inject_dat_path.txt";
+    static const char dat_key_path[] = "Z:\\tmp\\melammu_inject_dat_path.txt";
 
     FILE         *f, *lg;
     BYTE         *raw_px = NULL;
@@ -528,21 +528,21 @@ static void wukiyo_patch_dat_file_impl(int slot)
     UINT16        v_u16;
 
     /* 1. Load per-slot snap.  /tmp first, then persistent fallback. */
-    snprintf(snap_path, sizeof(snap_path), "Z:\\tmp\\wukiyo_snap_%03d.bgra", slot);
-    if (!wukiyo_load_snap_uncached(snap_path, &raw_px, &fw, &fh, &fstride))
+    snprintf(snap_path, sizeof(snap_path), "Z:\\tmp\\melammu_snap_%03d.bgra", slot);
+    if (!swingby_load_snap_uncached(snap_path, &raw_px, &fw, &fh, &fstride))
     {
         const char *home = getenv("HOME");
         if (home)
         {
             snprintf(snap_path, sizeof(snap_path),
-                     "%s/.wukiyo_snaps/wukiyo_snap_%03d.bgra", home, slot);
-            if (!wukiyo_load_snap_uncached(snap_path, &raw_px, &fw, &fh, &fstride))
+                     "%s/.melammu_snaps/melammu_snap_%03d.bgra", home, slot);
+            if (!swingby_load_snap_uncached(snap_path, &raw_px, &fw, &fh, &fstride))
                 raw_px = NULL;
         }
     }
     if (!raw_px)
     {
-        lg = fopen("Z:\\tmp\\wukiyo_patch_dbg.txt","w");
+        lg = fopen("Z:\\tmp\\swingby_patch_dbg.txt","w");
         if (lg) { fprintf(lg,"no snap for slot %d\n", slot); fclose(lg); }
         return;
     }
@@ -571,7 +571,7 @@ static void wukiyo_patch_dat_file_impl(int slot)
     }
     if (!dat_path[0])
     {
-        lg = fopen("Z:\\tmp\\wukiyo_patch_dbg.txt","w");
+        lg = fopen("Z:\\tmp\\swingby_patch_dbg.txt","w");
         if (lg) { fprintf(lg,"no dat path\n"); fclose(lg); }
         HeapFree(GetProcessHeap(), 0, raw_px);
         return;
@@ -581,7 +581,7 @@ static void wukiyo_patch_dat_file_impl(int slot)
     f = fopen(dat_path, "rb");
     if (!f)
     {
-        lg = fopen("Z:\\tmp\\wukiyo_patch_dbg.txt","w");
+        lg = fopen("Z:\\tmp\\swingby_patch_dbg.txt","w");
         if (lg) { fprintf(lg,"open failed: %s\n", dat_path); fclose(lg); }
         HeapFree(GetProcessHeap(), 0, raw_px);
         return;
@@ -596,7 +596,7 @@ static void wukiyo_patch_dat_file_impl(int slot)
         fclose(f);
         if (dat) HeapFree(GetProcessHeap(), 0, dat);
         HeapFree(GetProcessHeap(), 0, raw_px);
-        lg = fopen("Z:\\tmp\\wukiyo_patch_dbg.txt","w");
+        lg = fopen("Z:\\tmp\\swingby_patch_dbg.txt","w");
         if (lg) { fprintf(lg,"read failed: %s sz=%ld\n", dat_path, dat_size); fclose(lg); }
         return;
     }
@@ -605,7 +605,7 @@ static void wukiyo_patch_dat_file_impl(int slot)
     /* 4. Validate magic and extract blob layout. */
     if (dat[0] != 'C' || dat[1] != 'S' || dat[2] != 'V' || dat[3] != '2')
     {
-        lg = fopen("Z:\\tmp\\wukiyo_patch_dbg.txt","w");
+        lg = fopen("Z:\\tmp\\swingby_patch_dbg.txt","w");
         if (lg) { fprintf(lg,"not CSV2: %s\n", dat_path); fclose(lg); }
         HeapFree(GetProcessHeap(), 0, dat);
         HeapFree(GetProcessHeap(), 0, raw_px);
@@ -620,7 +620,7 @@ static void wukiyo_patch_dat_file_impl(int slot)
     checksum_off = blob2_off + cs2;
     if (checksum_off + 2 > (size_t)dat_size)
     {
-        lg = fopen("Z:\\tmp\\wukiyo_patch_dbg.txt","w");
+        lg = fopen("Z:\\tmp\\swingby_patch_dbg.txt","w");
         if (lg) { fprintf(lg,"layout OOB cs0=%u cs1=%u cs2=%u datsz=%ld\n",
                               cs0, cs1, cs2, dat_size); fclose(lg); }
         HeapFree(GetProcessHeap(), 0, dat);
@@ -630,7 +630,7 @@ static void wukiyo_patch_dat_file_impl(int slot)
 
     /* 5. Build 192x108 24-bpp BMP (bottom-up BGR) from top-down BGRA snap.
      * 192*3 = 576 bytes/row, already 4-byte aligned (no row padding needed). */
-    bmp = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, WUKIYO_BMP_TOTAL_BYTES);
+    bmp = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, SWINGBY_BMP_TOTAL_BYTES);
     if (!bmp)
     {
         HeapFree(GetProcessHeap(), 0, dat);
@@ -639,28 +639,28 @@ static void wukiyo_patch_dat_file_impl(int slot)
     }
 
     bmp[0] = 'B'; bmp[1] = 'M';
-    v_u32 = WUKIYO_BMP_TOTAL_BYTES; memcpy(bmp +  2, &v_u32, 4); /* file size */
+    v_u32 = SWINGBY_BMP_TOTAL_BYTES; memcpy(bmp +  2, &v_u32, 4); /* file size */
     /* reserved (offset 6, 4 bytes) = 0 */
     v_u32 = 54;                     memcpy(bmp + 10, &v_u32, 4); /* pixel data offset */
     v_u32 = 40;                     memcpy(bmp + 14, &v_u32, 4); /* DIB header size */
-    v_i32 = WUKIYO_BMP_W;           memcpy(bmp + 18, &v_i32, 4); /* width */
-    v_i32 = WUKIYO_BMP_H;           memcpy(bmp + 22, &v_i32, 4); /* height (positive = bottom-up) */
+    v_i32 = SWINGBY_BMP_W;           memcpy(bmp + 18, &v_i32, 4); /* width */
+    v_i32 = SWINGBY_BMP_H;           memcpy(bmp + 22, &v_i32, 4); /* height (positive = bottom-up) */
     v_u16 = 1;                      memcpy(bmp + 26, &v_u16, 2); /* planes */
     v_u16 = 24;                     memcpy(bmp + 28, &v_u16, 2); /* bpp */
     /* compression (offset 30, BI_RGB = 0) already zero */
-    v_u32 = WUKIYO_BMP_PIX_BYTES;   memcpy(bmp + 34, &v_u32, 4); /* raw image size */
+    v_u32 = SWINGBY_BMP_PIX_BYTES;   memcpy(bmp + 34, &v_u32, 4); /* raw image size */
     /* x/y ppm, colors_used, important_colors at 38..50 already zero */
 
     /* BMP row r (0 = bottom) ← visual row (BMP_H-1-r), nearest-neighbor scaled. */
-    for (dy = 0; dy < WUKIYO_BMP_H; dy++)
+    for (dy = 0; dy < SWINGBY_BMP_H; dy++)
     {
-        unsigned int visual_row = (unsigned int)(WUKIYO_BMP_H - 1 - dy);
-        unsigned int sy = (unsigned int)((UINT64)visual_row * fh / WUKIYO_BMP_H);
+        unsigned int visual_row = (unsigned int)(SWINGBY_BMP_H - 1 - dy);
+        unsigned int sy = (unsigned int)((UINT64)visual_row * fh / SWINGBY_BMP_H);
         const BYTE *src_row = raw_px + (SIZE_T)sy * fstride;
-        BYTE *dst_row = bmp + 54 + (SIZE_T)dy * (WUKIYO_BMP_W * 3);
-        for (dx = 0; dx < WUKIYO_BMP_W; dx++)
+        BYTE *dst_row = bmp + 54 + (SIZE_T)dy * (SWINGBY_BMP_W * 3);
+        for (dx = 0; dx < SWINGBY_BMP_W; dx++)
         {
-            unsigned int sx = (unsigned int)((UINT64)dx * fw / WUKIYO_BMP_W);
+            unsigned int sx = (unsigned int)((UINT64)dx * fw / SWINGBY_BMP_W);
             const BYTE *sp = src_row + sx * 4;
             BYTE *dp = dst_row + dx * 3;
             dp[0] = sp[0]; /* B */
@@ -671,7 +671,7 @@ static void wukiyo_patch_dat_file_impl(int slot)
     HeapFree(GetProcessHeap(), 0, raw_px);
 
     /* 6. LZSS-encode the BMP. */
-    lzss = wukiyo_lzss_all_literal(bmp, WUKIYO_BMP_TOTAL_BYTES, &lzss_len);
+    lzss = swingby_lzss_all_literal(bmp, SWINGBY_BMP_TOTAL_BYTES, &lzss_len);
     HeapFree(GetProcessHeap(), 0, bmp);
     if (!lzss) { HeapFree(GetProcessHeap(), 0, dat); return; }
 
@@ -689,7 +689,7 @@ static void wukiyo_patch_dat_file_impl(int slot)
     /* Header patches: total body size (0x21C), new blob-1 comp/raw (0x234/0x248). */
     v_u32 = cs0 + (UINT32)lzss_len + cs2; memcpy(new_dat + 0x21C, &v_u32, 4);
     v_u32 = (UINT32)lzss_len;             memcpy(new_dat + 0x234, &v_u32, 4);
-    v_u32 = (UINT32)WUKIYO_BMP_TOTAL_BYTES; memcpy(new_dat + 0x248, &v_u32, 4);
+    v_u32 = (UINT32)SWINGBY_BMP_TOTAL_BYTES; memcpy(new_dat + 0x248, &v_u32, 4);
 
     memcpy(new_dat + blob0_off,                       dat + blob0_off,    cs0);
     memcpy(new_dat + blob0_off + cs0,                 lzss,               lzss_len);
@@ -703,14 +703,14 @@ static void wukiyo_patch_dat_file_impl(int slot)
     f = fopen(dat_path, "wb");
     if (!f)
     {
-        lg = fopen("Z:\\tmp\\wukiyo_patch_dbg.txt","w");
+        lg = fopen("Z:\\tmp\\swingby_patch_dbg.txt","w");
         if (lg) { fprintf(lg, "open-for-write failed: %s\n", dat_path); fclose(lg); }
     }
     else
     {
         size_t wrote = fwrite(new_dat, 1, new_total, f);
         fclose(f);
-        lg = fopen("Z:\\tmp\\wukiyo_patch_dbg.txt","w");
+        lg = fopen("Z:\\tmp\\swingby_patch_dbg.txt","w");
         if (lg) { fprintf(lg, "patch slot=%d %s old_cs1=%u new_cs1=%lu total=%lu wrote=%lu\n",
                               slot, dat_path, cs1, (unsigned long)lzss_len, (unsigned long)new_total, (unsigned long)wrote); fclose(lg); }
     }
@@ -719,20 +719,20 @@ static void wukiyo_patch_dat_file_impl(int slot)
     HeapFree(GetProcessHeap(), 0, dat);
 }
 
-/* Worker thread entry point — runs wukiyo_patch_dat_file_impl off the render thread. */
-static DWORD WINAPI wukiyo_patch_dat_thread(LPVOID arg)
+/* Worker thread entry point — runs swingby_patch_dat_file_impl off the render thread. */
+static DWORD WINAPI swingby_patch_dat_thread(LPVOID arg)
 {
     int slot = (int)(INT_PTR)arg;
-    wukiyo_patch_dat_file_impl(slot);
+    swingby_patch_dat_file_impl(slot);
     return 0;
 }
 
 /* Render-thread-safe entry point.  Spawns a worker and returns immediately. */
-static void wukiyo_patch_dat_file(int slot)
+static void swingby_patch_dat_file(int slot)
 {
     HANDLE h;
     if (slot < 0) return;
-    h = CreateThread(NULL, 0, wukiyo_patch_dat_thread, (LPVOID)(INT_PTR)slot, 0, NULL);
+    h = CreateThread(NULL, 0, swingby_patch_dat_thread, (LPVOID)(INT_PTR)slot, 0, NULL);
     if (h) CloseHandle(h);
 }
 
@@ -753,7 +753,7 @@ static unsigned int       s_last_good_stride = 0;
 static DWORD              s_last_good_tick = 0;
 static unsigned long      s_last_good_avg = 0;
 
-static unsigned long wukiyo_log_lock_sample(const char *tag, IDirect3DSurface9 *iface,
+static unsigned long swingby_log_lock_sample(const char *tag, IDirect3DSurface9 *iface,
         const struct wined3d_sub_resource_desc *desc, const RECT *rect,
         DWORD flags, const struct wined3d_map_desc *map_desc)
 {
@@ -787,7 +787,7 @@ static unsigned long wukiyo_log_lock_sample(const char *tag, IDirect3DSurface9 *
         }
     }
 
-    lg = fopen("Z:\\tmp\\wukiyo_lock_detail.txt", "a");
+    lg = fopen("Z:\\tmp\\swingby_lock_detail.txt", "a");
     if (lg)
     {
         fprintf(lg,
@@ -806,7 +806,7 @@ static unsigned long wukiyo_log_lock_sample(const char *tag, IDirect3DSurface9 *
  * blt -> sysmem path and report its luminance.  Distinguishes "content exists
  * on the GPU but the CPU map is stale/black" from "the surface really has no
  * content at lock time". */
-static void wukiyo_probe_gpu_content(IDirect3DSurface9 *iface, struct d3d9_surface *surface,
+static void swingby_probe_gpu_content(IDirect3DSurface9 *iface, struct d3d9_surface *surface,
         const struct wined3d_sub_resource_desc *desc)
 {
     IDirect3DSurface9 *probe = NULL;
@@ -816,7 +816,7 @@ static void wukiyo_probe_gpu_content(IDirect3DSurface9 *iface, struct d3d9_surfa
     RECT r;
     HRESULT hr;
 
-    wukiyo_rt_capture_active = TRUE;
+    swingby_rt_capture_active = TRUE;
 
     hr = IDirect3DDevice9Ex_CreateOffscreenPlainSurface(surface->parent_device,
             desc->width, desc->height, d3d_format, D3DPOOL_SYSTEMMEM, &probe, NULL);
@@ -838,22 +838,22 @@ static void wukiyo_probe_gpu_content(IDirect3DSurface9 *iface, struct d3d9_surfa
                 && SUCCEEDED(wined3d_resource_map(wined3d_texture_get_resource(probe_impl->wined3d_texture),
                         probe_impl->sub_resource_idx, &map_desc, NULL, WINED3D_MAP_READ)))
         {
-            unsigned long avg = wukiyo_log_lock_sample("DIAG_GPU_PROBE", iface, desc, NULL, 0, &map_desc);
-            wukiyo_diag("GPU_PROBE surf=%p %ux%u blt_avg=%lu",
+            unsigned long avg = swingby_log_lock_sample("DIAG_GPU_PROBE", iface, desc, NULL, 0, &map_desc);
+            swingby_diag("GPU_PROBE surf=%p %ux%u blt_avg=%lu",
                     (void *)iface, desc->width, desc->height, avg);
             wined3d_resource_unmap(wined3d_texture_get_resource(probe_impl->wined3d_texture),
                     probe_impl->sub_resource_idx);
         }
         else
-            wukiyo_diag("GPU_PROBE surf=%p blt/map failed hr=0x%lx",
+            swingby_diag("GPU_PROBE surf=%p blt/map failed hr=0x%lx",
                     (void *)iface, (unsigned long)hr);
         IDirect3DSurface9_Release(probe);
     }
     else
-        wukiyo_diag("GPU_PROBE surf=%p create failed hr=0x%lx",
+        swingby_diag("GPU_PROBE surf=%p create failed hr=0x%lx",
                 (void *)iface, (unsigned long)hr);
 
-    wukiyo_rt_capture_active = FALSE;
+    swingby_rt_capture_active = FALSE;
 }
 
 /* Diag: most recent full-resolution write lock, sampled again at UnlockRect to
@@ -876,7 +876,7 @@ static struct wined3d_sub_resource_desc s_diag_write_desc;
 static BYTE        *s_lastpres_frame;
 static unsigned int s_lastpres_w, s_lastpres_h, s_lastpres_stride;
 
-void wukiyo_store_last_presented(const void *data, unsigned int pitch,
+void swingby_store_last_presented(const void *data, unsigned int pitch,
         unsigned int w, unsigned int h)
 {
     SIZE_T row_bytes = (SIZE_T)w * 4;
@@ -901,7 +901,7 @@ void wukiyo_store_last_presented(const void *data, unsigned int pitch,
                 (const BYTE *)data + (SIZE_T)y * pitch, row_bytes);
 }
 
-static void wukiyo_remember_last_good_frame(const struct wined3d_sub_resource_desc *desc,
+static void swingby_remember_last_good_frame(const struct wined3d_sub_resource_desc *desc,
         DWORD flags, const struct wined3d_map_desc *map_desc, unsigned long avg)
 {
     SIZE_T row_bytes = (SIZE_T)desc->width * 4;
@@ -941,18 +941,18 @@ static void wukiyo_remember_last_good_frame(const struct wined3d_sub_resource_de
     s_last_good_tick = GetTickCount();
     s_last_good_avg = avg;
 
-    lg = fopen("Z:\\tmp\\wukiyo_lock_detail.txt", "a");
+    lg = fopen("Z:\\tmp\\swingby_lock_detail.txt", "a");
     if (lg)
     {
         fprintf(lg, "LAST_GOOD_FRAME 1280x720 avg=%lu tick=%lu active=%u\n",
-                s_last_good_avg, (unsigned long)s_last_good_tick, wukiyo_rt_capture_active);
+                s_last_good_avg, (unsigned long)s_last_good_tick, swingby_rt_capture_active);
         fclose(lg);
     }
 }
 
-static void wukiyo_write_last_good_snap_file(void)
+static void swingby_write_last_good_snap_file(void)
 {
-    static const char snap_out[] = "Z:\\tmp\\wukiyo_snap.bgra";
+    static const char snap_out[] = "Z:\\tmp\\melammu_snap.bgra";
     uint32_t w, h, s;
     unsigned int y;
     FILE *f;
@@ -976,23 +976,23 @@ static void wukiyo_write_last_good_snap_file(void)
                 s_last_good_width * 4, 1, f);
     fclose(f);
 
-    wukiyo_snap_tick = GetTickCount();
+    melammu_snap_tick = GetTickCount();
 
-    lg = fopen("Z:\\tmp\\wukiyo_lock_detail.txt", "a");
+    lg = fopen("Z:\\tmp\\swingby_lock_detail.txt", "a");
     if (lg)
     {
         fprintf(lg, "SNAP_FROM_LAST_GOOD 1280x720 avg=%lu tick=%lu\n",
-                s_last_good_avg, (unsigned long)wukiyo_snap_tick);
+                s_last_good_avg, (unsigned long)melammu_snap_tick);
         fclose(lg);
     }
 }
 
-static BOOL wukiyo_fill_shadow_from_last_good(IDirect3DSurface9 *iface,
+static BOOL swingby_fill_shadow_from_last_good(IDirect3DSurface9 *iface,
         const struct wined3d_sub_resource_desc *desc, const RECT *rect,
         DWORD flags, const struct wined3d_map_desc *map_desc, unsigned long avg)
 {
     DWORD now = GetTickCount();
-    DWORD max_age = wukiyo_save_screen_cooldown ? 120000 : 5000;
+    DWORD max_age = swingby_save_screen_cooldown ? 120000 : 5000;
     SIZE_T row_bytes = (SIZE_T)desc->width * 4;
     unsigned int y;
     FILE *lg;
@@ -1001,13 +1001,13 @@ static BOOL wukiyo_fill_shadow_from_last_good(IDirect3DSurface9 *iface,
         return FALSE;
     if (!s_last_good_frame || !s_last_good_tick || (DWORD)(now - s_last_good_tick) > max_age)
     {
-        lg = fopen("Z:\\tmp\\wukiyo_lock_detail.txt", "a");
+        lg = fopen("Z:\\tmp\\swingby_lock_detail.txt", "a");
         if (lg)
         {
             fprintf(lg,
                     "LOCK_SHADOW_FILL_SKIP no_recent_last_good surf=%p age=%lu max_age=%lu cooldown=%u has=%u tick=%lu avg_before=%lu\n",
                     (void *)iface, s_last_good_tick ? (unsigned long)(now - s_last_good_tick) : 0,
-                    (unsigned long)max_age, wukiyo_save_screen_cooldown,
+                    (unsigned long)max_age, swingby_save_screen_cooldown,
                     s_last_good_frame ? 1 : 0, (unsigned long)s_last_good_tick, avg);
             fclose(lg);
         }
@@ -1016,7 +1016,7 @@ static BOOL wukiyo_fill_shadow_from_last_good(IDirect3DSurface9 *iface,
     if (desc->width != s_last_good_width || desc->height != s_last_good_height
             || row_bytes != s_last_good_stride)
     {
-        lg = fopen("Z:\\tmp\\wukiyo_lock_detail.txt", "a");
+        lg = fopen("Z:\\tmp\\swingby_lock_detail.txt", "a");
         if (lg)
         {
             fprintf(lg,
@@ -1034,7 +1034,7 @@ static BOOL wukiyo_fill_shadow_from_last_good(IDirect3DSurface9 *iface,
         memcpy((BYTE *)map_desc->data + (SIZE_T)y * map_desc->row_pitch,
                 s_last_good_frame + (SIZE_T)y * s_last_good_stride, row_bytes);
 
-    lg = fopen("Z:\\tmp\\wukiyo_lock_detail.txt", "a");
+    lg = fopen("Z:\\tmp\\swingby_lock_detail.txt", "a");
     if (lg)
     {
         fprintf(lg,
@@ -1043,7 +1043,7 @@ static BOOL wukiyo_fill_shadow_from_last_good(IDirect3DSurface9 *iface,
                 (unsigned long)(now - s_last_good_tick), avg, s_last_good_avg);
         fclose(lg);
     }
-    wukiyo_write_last_good_snap_file();
+    swingby_write_last_good_snap_file();
     return TRUE;
 }
 
@@ -1068,13 +1068,13 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
     /* Diag: full-resolution locks are the save-thumbnail readback candidates.
      * Log them all, and for read-only locks also probe the GPU-side content
      * through an independent blt so map-vs-GPU divergence is visible. */
-    if (!wukiyo_rt_capture_active && desc.width >= 640 && desc.height >= 400)
+    if (!swingby_rt_capture_active && desc.width >= 640 && desc.height >= 400)
     {
-        wukiyo_diag("LockRect surf=%p %ux%u flags=0x%lx acc=0x%x bind=0x%x rect=%s",
+        swingby_diag("LockRect surf=%p %ux%u flags=0x%lx acc=0x%x bind=0x%x rect=%s",
                 (void *)iface, desc.width, desc.height, (unsigned long)flags,
                 desc.access, desc.bind_flags, rect ? "sub" : "full");
-        if (wukiyo_observe_only && (flags & D3DLOCK_READONLY))
-            wukiyo_probe_gpu_content(iface, surface, &desc);
+        if (swingby_observe_only && (flags & D3DLOCK_READONLY))
+            swingby_probe_gpu_content(iface, surface, &desc);
     }
 
     /* Retired 2026-06-11: the sysmem-shadow + last-good-fill route is
@@ -1083,7 +1083,7 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
      * reference until the fix is user-verified. */
     if (0
             && (flags & D3DLOCK_READONLY)
-            && !wukiyo_rt_capture_active
+            && !swingby_rt_capture_active
             && !s_shadow_lock_surface
             && desc.access == (WINED3D_RESOURCE_ACCESS_GPU
                     | WINED3D_RESOURCE_ACCESS_MAP_R | WINED3D_RESOURCE_ACCESS_MAP_W)
@@ -1097,7 +1097,7 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
         D3DFORMAT d3d_format = d3dformat_from_wined3dformat(desc.format);
 
         {
-            FILE *lg = fopen("Z:\\tmp\\wukiyo_lock.txt","a");
+            FILE *lg = fopen("Z:\\tmp\\swingby_lock.txt","a");
             if (lg)
             {
                 fprintf(lg,
@@ -1129,15 +1129,15 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
                         wined3dmapflags_from_d3dmapflags(flags, 0));
                 if (SUCCEEDED(hr))
                 {
-                    unsigned long avg = wukiyo_log_lock_sample("LOCK_SHADOW_SAMPLE", iface, &desc, rect, flags, &map_desc);
-                    if (wukiyo_fill_shadow_from_last_good(iface, &desc, rect, flags, &map_desc, avg))
-                        wukiyo_log_lock_sample("LOCK_SHADOW_SAMPLE_AFTER_FILL", iface, &desc, rect, flags, &map_desc);
+                    unsigned long avg = swingby_log_lock_sample("LOCK_SHADOW_SAMPLE", iface, &desc, rect, flags, &map_desc);
+                    if (swingby_fill_shadow_from_last_good(iface, &desc, rect, flags, &map_desc, avg))
+                        swingby_log_lock_sample("LOCK_SHADOW_SAMPLE_AFTER_FILL", iface, &desc, rect, flags, &map_desc);
                     locked_rect->Pitch = map_desc.row_pitch;
                     locked_rect->pBits = map_desc.data;
                     s_shadow_lock_iface = iface;
                     s_shadow_lock_surface = shadow;
                     {
-                        FILE *lg = fopen("Z:\\tmp\\wukiyo_lock.txt","a");
+                        FILE *lg = fopen("Z:\\tmp\\swingby_lock.txt","a");
                         if (lg)
                         {
                             fprintf(lg,
@@ -1153,7 +1153,7 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
             }
 
             {
-                FILE *lg = fopen("Z:\\tmp\\wukiyo_lock.txt","a");
+                FILE *lg = fopen("Z:\\tmp\\swingby_lock.txt","a");
                 if (lg)
                 {
                     fprintf(lg,
@@ -1167,7 +1167,7 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
         }
         else
         {
-            FILE *lg = fopen("Z:\\tmp\\wukiyo_lock.txt","a");
+            FILE *lg = fopen("Z:\\tmp\\swingby_lock.txt","a");
             if (lg)
             {
                 fprintf(lg,
@@ -1187,20 +1187,20 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
         locked_rect->Pitch = map_desc.row_pitch;
         locked_rect->pBits = map_desc.data;
 
-        /* Wukiyo CMVS save-thumbnail capture: only when explicitly enabled by
-         * the launcher (WUKIYO_CMVS_THUMBS=1).  When OFF this whole block is
+        /* Melammu CMVS save-thumbnail capture: only when explicitly enabled by
+         * the launcher (MELAMMU_CMVS_THUMBS=1).  When OFF this whole block is
          * skipped so LockRect is byte-for-byte stock wine — required so the
          * last-presented serve below never corrupts non-CMVS games' back-buffer
          * READONLY locks (the KiriKiri Z white-screen). */
-        if (wukiyo_capture_is_enabled())
+        if (swingby_capture_is_enabled())
         {
         /* Windows windowed-present copy semantics: a READONLY lock of the
          * implicit swapchain's back buffer returns the last presented frame.
          * The native map is black on the Metal path, so fill it from the
-         * per-Present copy taken in wukiyo_capture_frontbuffer().  CMVS locks
+         * per-Present copy taken in swingby_capture_frontbuffer().  CMVS locks
          * with an explicit full-surface rect; map_desc.data then points at
          * the rect origin, so copy with the rect offset applied. */
-        if ((flags & D3DLOCK_READONLY) && !wukiyo_rt_capture_active
+        if ((flags & D3DLOCK_READONLY) && !swingby_rt_capture_active
                 && map_desc.data && s_lastpres_frame
                 && desc.width == s_lastpres_w && desc.height == s_lastpres_h
                 && (desc.bind_flags & WINED3D_BIND_RENDER_TARGET))
@@ -1229,7 +1229,7 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
                         memcpy((BYTE *)map_desc.data + (SIZE_T)y * map_desc.row_pitch,
                                 s_lastpres_frame + (SIZE_T)(y0 + y) * s_lastpres_stride + (SIZE_T)x0 * 4,
                                 (SIZE_T)cw * 4);
-                    wukiyo_diag("BB_SERVE_LAST_PRESENTED surf=%p rect=(%u,%u %ux%u)",
+                    swingby_diag("BB_SERVE_LAST_PRESENTED surf=%p rect=(%u,%u %ux%u)",
                             (void *)iface, x0, y0, cw, ch);
                 }
             }
@@ -1239,9 +1239,9 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
         if (map_desc.data)
         {
             { static DWORD s_lr_throttle = 0; DWORD _now = GetTickCount();
-              if (!wukiyo_rt_capture_active
+              if (!swingby_rt_capture_active
                   && (desc.width != 192 || desc.height != 108) && (DWORD)(_now - s_lr_throttle) > 200) {
-                FILE *lg2 = fopen("Z:\\tmp\\wukiyo_lock.txt","a");
+                FILE *lg2 = fopen("Z:\\tmp\\swingby_lock.txt","a");
                 if (lg2) { fprintf(lg2,"LockRect %ux%u flags=0x%lx acc=0x%x\n",
                     desc.width,desc.height,(unsigned long)flags,desc.access); fclose(lg2); s_lr_throttle=_now; } } }
 
@@ -1255,7 +1255,7 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
                 BOOL capture_access = (desc.access == 0xd) || (desc.access == 0xe);
 
                 if ((flags & 0x10) /* D3DLOCK_READONLY */
-                    && !wukiyo_rt_capture_active
+                    && !swingby_rt_capture_active
                     && capture_access
                     && (desc.width >= 640) && (desc.height >= 400))
                 {
@@ -1264,7 +1264,7 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
                         && (DWORD)(lock_now - s_rtdata_tick) < 5000;
                     if (matched && !s_rtdata_lock_logged)
                     {
-                        FILE *lg = fopen("Z:\\tmp\\wukiyo_lock.txt","a");
+                        FILE *lg = fopen("Z:\\tmp\\swingby_lock.txt","a");
                         if (lg)
                         {
                             fprintf(lg,
@@ -1282,7 +1282,7 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
             if (desc.width == 192 && desc.height == 108)
             {
                 /* Tell device.c to pause auto-capture: save screen is open. */
-                wukiyo_save_screen_cooldown = 1800; /* ~30s at 60fps; keep the pre-save gameplay snap */
+                swingby_save_screen_cooldown = 1800; /* ~30s at 60fps; keep the pre-save gameplay snap */
 
                 /* The old per-slot preview injection counted 192x108 LockRect calls
                  * and mapped them to save slots.  CMVS does not render slots in a
@@ -1292,10 +1292,10 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
                  * capture path above. */
             }
 
-            if (desc.width >= 640 && desc.height >= 400 && !wukiyo_rt_capture_active)
+            if (desc.width >= 640 && desc.height >= 400 && !swingby_rt_capture_active)
             {
-                unsigned long avg = wukiyo_log_lock_sample("LOCK_SAMPLE", iface, &desc, rect, flags, &map_desc);
-                wukiyo_diag("LOCK_MAP surf=%p flags=0x%lx map_avg=%lu",
+                unsigned long avg = swingby_log_lock_sample("LOCK_SAMPLE", iface, &desc, rect, flags, &map_desc);
+                swingby_diag("LOCK_MAP surf=%p flags=0x%lx map_avg=%lu",
                         (void *)iface, (unsigned long)flags, avg);
                 if (!(flags & D3DLOCK_READONLY))
                 {
@@ -1306,8 +1306,8 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
                     s_diag_write_pitch = map_desc.row_pitch;
                     s_diag_write_desc  = desc;
                 }
-                if (!wukiyo_observe_only)
-                    wukiyo_remember_last_good_frame(&desc, flags, &map_desc, avg);
+                if (!swingby_observe_only)
+                    swingby_remember_last_good_frame(&desc, flags, &map_desc, avg);
             }
             else if (desc.width == 192 && desc.height == 108)
             {
@@ -1315,14 +1315,14 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
                 DWORD now192 = GetTickCount();
                 if ((DWORD)(now192 - s_l192_throttle) > 250)
                 {
-                    unsigned long avg = wukiyo_log_lock_sample("LOCK_SAMPLE", iface, &desc, rect, flags, &map_desc);
+                    unsigned long avg = swingby_log_lock_sample("LOCK_SAMPLE", iface, &desc, rect, flags, &map_desc);
                     s_l192_throttle = now192;
-                    wukiyo_diag("LOCK_192 surf=%p flags=0x%lx avg=%lu",
+                    swingby_diag("LOCK_192 surf=%p flags=0x%lx avg=%lu",
                             (void *)iface, (unsigned long)flags, avg);
                 }
             }
         }
-        } /* end if (wukiyo_capture_is_enabled()) */
+        } /* end if (swingby_capture_is_enabled()) */
     }
 
     if (hr == E_INVALIDARG)
@@ -1347,7 +1347,7 @@ static HRESULT WINAPI d3d9_surface_UnlockRect(IDirect3DSurface9 *iface)
         wined3d_mutex_unlock();
 
         {
-            FILE *lg = fopen("Z:\\tmp\\wukiyo_lock.txt","a");
+            FILE *lg = fopen("Z:\\tmp\\swingby_lock.txt","a");
             if (lg)
             {
                 fprintf(lg, "UNLOCK_SHADOW_RT src=%p shadow=%p hr=0x%08lx\n",
@@ -1367,10 +1367,10 @@ static HRESULT WINAPI d3d9_surface_UnlockRect(IDirect3DSurface9 *iface)
      * this inject is live-preview only. */
     if (iface == s_unlock_iface && s_unlock_data != NULL)
     {
-        int injected = wukiyo_inject_snap_slot(s_unlock_data, s_unlock_pitch, s_unlock_slot);
+        int injected = swingby_inject_snap_slot(s_unlock_data, s_unlock_pitch, s_unlock_slot);
         if (injected)
         {
-            FILE *lg = fopen("Z:\\tmp\\wukiyo_inject_fired.txt","a");
+            FILE *lg = fopen("Z:\\tmp\\swingby_inject_fired.txt","a");
             if (lg) { fprintf(lg,"slot=%d ok\n", s_unlock_slot); fclose(lg); }
         }
         s_unlock_iface = NULL;
@@ -1386,8 +1386,8 @@ static HRESULT WINAPI d3d9_surface_UnlockRect(IDirect3DSurface9 *iface)
         md.data = s_diag_write_data;
         md.row_pitch = s_diag_write_pitch;
         md.slice_pitch = 0;
-        avg = wukiyo_log_lock_sample("DIAG_UNLOCK_WRITE", iface, &s_diag_write_desc, NULL, 0, &md);
-        wukiyo_diag("UNLOCK_WRITE surf=%p avg_after_write=%lu", (void *)iface, avg);
+        avg = swingby_log_lock_sample("DIAG_UNLOCK_WRITE", iface, &s_diag_write_desc, NULL, 0, &md);
+        swingby_diag("UNLOCK_WRITE surf=%p avg_after_write=%lu", (void *)iface, avg);
         s_diag_write_iface = NULL;
         s_diag_write_data = NULL;
     }
@@ -1423,7 +1423,7 @@ static HRESULT WINAPI d3d9_surface_GetDC(IDirect3DSurface9 *iface, HDC *dc)
     wined3d_texture_get_sub_resource_desc(surface->wined3d_texture, surface->sub_resource_idx, &_d);
     wined3d_mutex_unlock();
 
-    wukiyo_diag("GetDC surf=%p %ux%u hr=0x%08x dc=%p",
+    swingby_diag("GetDC surf=%p %ux%u hr=0x%08x dc=%p",
             (void *)iface, _d.width, _d.height, (unsigned)hr, dc ? (void *)*dc : NULL);
 
     return hr;
@@ -1444,7 +1444,7 @@ static HRESULT WINAPI d3d9_surface_ReleaseDC(IDirect3DSurface9 *iface, HDC dc)
         d3d9_texture_flag_auto_gen_mipmap(surface->texture);
     wined3d_mutex_unlock();
 
-    wukiyo_diag("ReleaseDC surf=%p %ux%u hr=0x%08x", (void *)iface, _d.width, _d.height, (unsigned)hr);
+    swingby_diag("ReleaseDC surf=%p %ux%u hr=0x%08x", (void *)iface, _d.width, _d.height, (unsigned)hr);
 
     return hr;
 }
