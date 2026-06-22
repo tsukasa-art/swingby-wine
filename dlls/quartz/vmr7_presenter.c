@@ -95,14 +95,14 @@ static ULONG WINAPI image_presenter_Release(IVMRImagePresenter *iface)
 
 static HRESULT WINAPI image_presenter_StartPresenting(IVMRImagePresenter *iface, DWORD_PTR cookie)
 {
-    FIXME("iface %p, cookie %#Ix, stub!\n", iface, cookie);
-    return E_NOTIMPL;
+    TRACE("iface %p, cookie %#Ix.\n", iface, cookie);
+    return S_OK;
 }
 
 static HRESULT WINAPI image_presenter_StopPresenting(IVMRImagePresenter *iface, DWORD_PTR cookie)
 {
-    FIXME("iface %p, cookie %#Ix, stub!\n", iface, cookie);
-    return E_NOTIMPL;
+    TRACE("iface %p, cookie %#Ix.\n", iface, cookie);
+    return S_OK;
 }
 
 static HRESULT WINAPI image_presenter_PresentImage(IVMRImagePresenter *iface,
@@ -111,7 +111,7 @@ static HRESULT WINAPI image_presenter_PresentImage(IVMRImagePresenter *iface,
     struct vmr7_presenter *presenter = impl_from_IVMRImagePresenter(iface);
     POINT point;
     HRESULT hr;
-    RECT rect;
+    RECT dst, src;
 
     TRACE("iface %p, cookie %#Ix, info %p.\n", iface, cookie, info);
 
@@ -122,17 +122,20 @@ static HRESULT WINAPI image_presenter_PresentImage(IVMRImagePresenter *iface,
             wine_dbgstr_rect(&info->rcSrc), wine_dbgstr_rect(&info->rcDst),
             info->dwTypeSpecificFlags, info->dwInterlaceFlags);
 
-    if (info->dwFlags & VMRSample_SrcDstRectsValid)
-        FIXME("Ignoring src/dst rects.\n");
+    src = info->rcSrc;
+    dst = info->rcDst;
+    if (!(info->dwFlags & VMRSample_SrcDstRectsValid) || IsRectEmpty(&src))
+        SetRect(&src, 0, 0, presenter->native_size.cx, presenter->native_size.cy);
 
-    GetClientRect(presenter->window, &rect);
+    if (!(info->dwFlags & VMRSample_SrcDstRectsValid) || IsRectEmpty(&dst))
+        GetClientRect(presenter->window, &dst);
     point.x = point.y = 0;
     ClientToScreen(presenter->window, &point);
-    OffsetRect(&rect, point.x, point.y);
-    if (FAILED(hr = IDirectDrawSurface7_Blt(presenter->primary, &rect, info->lpSurf, NULL, DDBLT_WAIT, NULL)))
+    OffsetRect(&dst, point.x, point.y);
+    if (FAILED(hr = IDirectDrawSurface7_Blt(presenter->primary, &dst, info->lpSurf, &src, DDBLT_WAIT, NULL)))
         ERR("Failed to blit, hr %#lx.\n", hr);
 
-    return S_OK;
+    return hr;
 }
 
 static const IVMRImagePresenterVtbl image_presenter_vtbl =

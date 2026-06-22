@@ -3058,7 +3058,7 @@ static void test_windowless_size(void)
     memset(&dst, 0xcc, sizeof(dst));
     hr = IVMRWindowlessControl_GetVideoPosition(windowless_control, NULL, &dst);
     ok(hr == S_OK, "Got hr %#lx.\n", hr);
-    SetRect(&expect, 0, 0, 0, 0);
+    GetClientRect(window, &expect);
     ok(EqualRect(&dst, &expect), "Got dest rect %s.\n", wine_dbgstr_rect(&dst));
 
     SetRect(&src, 4, 6, 16, 12);
@@ -3071,7 +3071,7 @@ static void test_windowless_size(void)
     ok(hr == S_OK, "Got hr %#lx.\n", hr);
     SetRect(&expect, 4, 6, 16, 12);
     ok(EqualRect(&src, &expect), "Got source rect %s.\n", wine_dbgstr_rect(&src));
-    SetRect(&expect, 0, 0, 0, 0);
+    GetClientRect(window, &expect);
     ok(EqualRect(&dst, &expect), "Got dest rect %s.\n", wine_dbgstr_rect(&dst));
 
     SetRect(&dst, 40, 60, 120, 160);
@@ -3238,18 +3238,21 @@ static HRESULT WINAPI presenter_StopPresenting(IVMRImagePresenter *iface, DWORD_
 static HRESULT WINAPI presenter_PresentImage(IVMRImagePresenter *iface, DWORD_PTR cookie, VMRPRESENTATIONINFO *info)
 {
     struct presenter *presenter = impl_from_IVMRImagePresenter(iface);
-    static const RECT rect;
+    RECT rect;
 
     if (winetest_debug > 1) trace("PresentImage(surface %p)\n", info->lpSurf);
 
     ok(cookie == 0xabacab, "Got cookie %#Ix.\n", cookie);
-    ok(info->dwFlags == VMRSample_TimeValid, "Got flags %#lx.\n", info->dwFlags);
+    ok(info->dwFlags == (VMRSample_SrcDstRectsValid | VMRSample_TimeValid | VMRSample_Preroll),
+            "Got flags %#lx.\n", info->dwFlags);
     todo_wine ok(info->lpSurf == presenter->surfaces[5 - presenter->got_PresentImage], "Got unexpected surface.\n");
     ok(!info->rtStart, "Got start time %s.\n", wine_dbgstr_longlong(info->rtStart));
     ok(info->rtEnd == 10000000, "Got end time %s.\n", wine_dbgstr_longlong(info->rtEnd));
-    todo_wine ok(info->szAspectRatio.cx == 120, "Got aspect ratio width %ld.\n", info->szAspectRatio.cx);
-    todo_wine ok(info->szAspectRatio.cy == 60, "Got aspect ratio height %ld.\n", info->szAspectRatio.cy);
+    ok(info->szAspectRatio.cx == 120, "Got aspect ratio width %ld.\n", info->szAspectRatio.cx);
+    ok(info->szAspectRatio.cy == 60, "Got aspect ratio height %ld.\n", info->szAspectRatio.cy);
+    SetRect(&rect, 4, 6, 16, 12);
     ok(EqualRect(&info->rcSrc, &rect), "Got source rect %s.\n", wine_dbgstr_rect(&info->rcSrc));
+    SetRect(&rect, 40, 60, 160, 120);
     ok(EqualRect(&info->rcDst, &rect), "Got dest rect %s.\n", wine_dbgstr_rect(&info->rcDst));
     ok(!info->dwTypeSpecificFlags, "Got type-specific flags %#lx.\n", info->dwTypeSpecificFlags);
     ok(!info->dwInterlaceFlags, "Got interlace flags %#lx.\n", info->dwInterlaceFlags);

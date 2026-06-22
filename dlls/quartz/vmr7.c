@@ -48,6 +48,29 @@ static const BITMAPINFOHEADER *get_bitmap_header(const AM_MEDIA_TYPE *mt)
         return &((VIDEOINFOHEADER2 *)mt->pbFormat)->bmiHeader;
 }
 
+static const RECT *get_source_rect(const AM_MEDIA_TYPE *mt)
+{
+    if (IsEqualGUID(&mt->formattype, &FORMAT_VideoInfo))
+        return &((VIDEOINFOHEADER *)mt->pbFormat)->rcSource;
+    else
+        return &((VIDEOINFOHEADER2 *)mt->pbFormat)->rcSource;
+}
+
+static const RECT *get_target_rect(const AM_MEDIA_TYPE *mt)
+{
+    if (IsEqualGUID(&mt->formattype, &FORMAT_VideoInfo))
+        return &((VIDEOINFOHEADER *)mt->pbFormat)->rcTarget;
+    else
+        return &((VIDEOINFOHEADER2 *)mt->pbFormat)->rcTarget;
+}
+
+static void get_native_video_rect(const AM_MEDIA_TYPE *mt, RECT *rect)
+{
+    const BITMAPINFOHEADER *bitmap_header = get_bitmap_header(mt);
+
+    SetRect(rect, 0, 0, bitmap_header->biWidth, abs(bitmap_header->biHeight));
+}
+
 struct vmr7
 {
     struct strmbase_renderer renderer;
@@ -166,7 +189,7 @@ static HRESULT vmr_render(struct strmbase_renderer *iface, IMediaSample *sample)
     struct vmr7 *filter = impl_from_IBaseFilter(&iface->filter.IBaseFilter_iface);
     unsigned int data_size, width, depth, src_pitch;
     const BITMAPINFOHEADER *bitmap_header;
-    REFERENCE_TIME start_time, end_time;
+    REFERENCE_TIME start_time = 0, end_time = 0;
     VMRPRESENTATIONINFO info = {0};
     DDSURFACEDESC2 surface_desc;
     BYTE *data = NULL;
@@ -181,7 +204,7 @@ static HRESULT vmr_render(struct strmbase_renderer *iface, IMediaSample *sample)
         return S_FALSE;
     }
 
-    info.dwFlags = VMR9Sample_SrcDstRectsValid;
+    info.dwFlags = VMRSample_SrcDstRectsValid;
 
     if (SUCCEEDED(hr = IMediaSample_GetTime(sample, &start_time, &end_time)))
         info.dwFlags |= VMR9Sample_TimeValid;
@@ -213,11 +236,12 @@ static HRESULT vmr_render(struct strmbase_renderer *iface, IMediaSample *sample)
     else /* packed YUV (UYVY or YUY2) or RGB */
         src_pitch = ((width * depth / 8) + 3) & ~3;
 
-    info.dwFlags = VMRSample_TimeValid;
     info.rtStart = start_time;
     info.rtEnd = end_time;
-    info.szAspectRatio.cx = width;
-    info.szAspectRatio.cy = height;
+    info.rcSrc = filter->window.src;
+    info.rcDst = filter->window.dst;
+    info.szAspectRatio.cx = info.rcDst.right - info.rcDst.left;
+    info.szAspectRatio.cy = info.rcDst.bottom - info.rcDst.top;
     info.lpSurf = filter->surfaces[(--filter->surface_index) % filter->surface_count];
 
     hr = IVMRSurfaceAllocator_PrepareSurface(filter->allocator, filter->cookie, info.lpSurf, 0);
@@ -389,19 +413,35 @@ static void vmr_stop_stream(struct strmbase_renderer *iface)
 static HRESULT vmr_connect(struct strmbase_renderer *iface, const AM_MEDIA_TYPE *mt)
 {
     struct vmr7 *filter = impl_from_IBaseFilter(&iface->filter.IBaseFilter_iface);
-    const BITMAPINFOHEADER *bitmap_header = get_bitmap_header(mt);
+    const RECT *source_rect = get_source_rect(mt), *target_rect = get_target_rect(mt);
     HWND window = filter->window.hwnd;
     HRESULT hr;
     RECT rect;
 
-    SetRect(&rect, 0, 0, bitmap_header->biWidth, bitmap_header->biHeight);
-    filter->window.src = rect;
+    if (filter->mode == VMRMode_Renderless && !IsRectEmpty(source_rect))
+        filter->window.src = *source_rect;
+    else
+        get_native_video_rect(mt, &filter->window.src);
 
-    AdjustWindowRectEx(&rect, GetWindowLongW(window, GWL_STYLE), FALSE,
-            GetWindowLongW(window, GWL_EXSTYLE));
-    SetWindowPos(window, NULL, 0, 0, rect.right - rect.left, rect.bottom - rect.top,
-            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-    GetClientRect(window, &filter->window.dst);
+    if (filter->mode == VMRMode_Renderless && !IsRectEmpty(target_rect))
+        filter->window.dst = *target_rect;
+    else if (filter->mode == VMRMode_Windowless && filter->clipping_window)
+        GetClientRect(filter->clipping_window, &filter->window.dst);
+    else
+        filter->window.dst = filter->window.src;
+
+    if (filter->mode == VMRMode_Windowed || !filter->mode)
+    {
+        rect = filter->window.dst;
+        if (IsRectEmpty(&rect))
+            get_native_video_rect(mt, &rect);
+
+        AdjustWindowRectEx(&rect, GetWindowLongW(window, GWL_STYLE), FALSE,
+                GetWindowLongW(window, GWL_EXSTYLE));
+        SetWindowPos(window, NULL, 0, 0, rect.right - rect.left, rect.bottom - rect.top,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        GetClientRect(window, &filter->window.dst);
+    }
 
     if (filter->mode
             || SUCCEEDED(hr = IVMRFilterConfig_SetRenderingMode(&filter->IVMRFilterConfig_iface, VMRMode_Windowed)))
@@ -512,7 +552,7 @@ static void vmr_get_default_rect(struct video_window *iface, RECT *rect)
     struct vmr7 *filter = impl_from_video_window(iface);
     const BITMAPINFOHEADER *bitmap_header = get_filter_bitmap_header(filter);
 
-    SetRect(rect, 0, 0, bitmap_header->biWidth, bitmap_header->biHeight);
+    SetRect(rect, 0, 0, bitmap_header->biWidth, abs(bitmap_header->biHeight));
 }
 
 static HRESULT vmr_get_current_image(struct video_window *iface, LONG *size, LONG *image)
