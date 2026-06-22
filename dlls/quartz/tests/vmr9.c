@@ -2981,19 +2981,22 @@ static HRESULT WINAPI presenter_PresentImage(IVMRImagePresenter9 *iface, DWORD_P
 {
     struct presenter *presenter = impl_from_IVMRImagePresenter9(iface);
     IDirect3DDevice9 *device;
-    static const RECT rect;
+    RECT rect;
 
     if (winetest_debug > 1) trace("PresentImage()\n");
     IDirect3DSurface9_GetDevice(info->lpSurf, &device);
     ok(device == presenter->device, "got %p, expected %p\n", device, presenter->device);
     IDirect3DDevice9_Release(device);
     ok(cookie == 0xabacab, "Got cookie %#Ix.\n", cookie);
-    todo_wine ok(info->dwFlags == VMR9Sample_TimeValid, "Got flags %#lx.\n", info->dwFlags);
+    ok(info->dwFlags == (VMR9Sample_SrcDstRectsValid | VMR9Sample_TimeValid | VMR9Sample_Preroll),
+            "Got flags %#lx.\n", info->dwFlags);
     ok(!info->rtStart, "Got start time %s.\n", wine_dbgstr_longlong(info->rtStart));
     ok(info->rtEnd == 10000000, "Got end time %s.\n", wine_dbgstr_longlong(info->rtEnd));
-    todo_wine ok(info->szAspectRatio.cx == 120, "Got aspect ratio width %ld.\n", info->szAspectRatio.cx);
-    todo_wine ok(info->szAspectRatio.cy == 60, "Got aspect ratio height %ld.\n", info->szAspectRatio.cy);
+    ok(info->szAspectRatio.cx == 120, "Got aspect ratio width %ld.\n", info->szAspectRatio.cx);
+    ok(info->szAspectRatio.cy == 60, "Got aspect ratio height %ld.\n", info->szAspectRatio.cy);
+    SetRect(&rect, 4, 6, 16, 12);
     ok(EqualRect(&info->rcSrc, &rect), "Got source rect %s.\n", wine_dbgstr_rect(&info->rcSrc));
+    SetRect(&rect, 40, 60, 160, 120);
     ok(EqualRect(&info->rcDst, &rect), "Got dest rect %s.\n", wine_dbgstr_rect(&info->rcDst));
     ok(!info->dwReserved1, "Got dwReserved1 %#lx.\n", info->dwReserved1);
     ok(!info->dwReserved2, "Got dwReserved2 %#lx.\n", info->dwReserved2);
@@ -4088,7 +4091,7 @@ static void test_windowless_size(void)
     memset(&dst, 0xcc, sizeof(dst));
     hr = IVMRWindowlessControl9_GetVideoPosition(windowless_control, NULL, &dst);
     ok(hr == S_OK, "Got hr %#lx.\n", hr);
-    SetRect(&expect, 0, 0, 0, 0);
+    GetClientRect(window, &expect);
     ok(EqualRect(&dst, &expect), "Got dest rect %s.\n", wine_dbgstr_rect(&dst));
 
     SetRect(&src, 4, 6, 16, 12);
@@ -4101,7 +4104,7 @@ static void test_windowless_size(void)
     ok(hr == S_OK, "Got hr %#lx.\n", hr);
     SetRect(&expect, 4, 6, 16, 12);
     ok(EqualRect(&src, &expect), "Got source rect %s.\n", wine_dbgstr_rect(&src));
-    SetRect(&expect, 0, 0, 0, 0);
+    GetClientRect(window, &expect);
     ok(EqualRect(&dst, &expect), "Got dest rect %s.\n", wine_dbgstr_rect(&dst));
 
     SetRect(&dst, 40, 60, 120, 160);

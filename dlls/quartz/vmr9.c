@@ -54,6 +54,29 @@ static const BITMAPINFOHEADER *get_bitmap_header(const AM_MEDIA_TYPE *mt)
         return &((VIDEOINFOHEADER2 *)mt->pbFormat)->bmiHeader;
 }
 
+static const RECT *get_source_rect(const AM_MEDIA_TYPE *mt)
+{
+    if (IsEqualGUID(&mt->formattype, &FORMAT_VideoInfo))
+        return &((VIDEOINFOHEADER *)mt->pbFormat)->rcSource;
+    else
+        return &((VIDEOINFOHEADER2 *)mt->pbFormat)->rcSource;
+}
+
+static const RECT *get_target_rect(const AM_MEDIA_TYPE *mt)
+{
+    if (IsEqualGUID(&mt->formattype, &FORMAT_VideoInfo))
+        return &((VIDEOINFOHEADER *)mt->pbFormat)->rcTarget;
+    else
+        return &((VIDEOINFOHEADER2 *)mt->pbFormat)->rcTarget;
+}
+
+static void get_native_video_rect(const AM_MEDIA_TYPE *mt, RECT *rect)
+{
+    const BITMAPINFOHEADER *bitmap_header = get_bitmap_header(mt);
+
+    SetRect(rect, 0, 0, bitmap_header->biWidth, abs(bitmap_header->biHeight));
+}
+
 struct quartz_vmr
 {
     struct strmbase_renderer renderer;
@@ -222,7 +245,7 @@ static HRESULT vmr_render(struct strmbase_renderer *iface, IMediaSample *sample)
     struct quartz_vmr *filter = impl_from_IBaseFilter(&iface->filter.IBaseFilter_iface);
     unsigned int data_size, width, depth, src_pitch;
     const BITMAPINFOHEADER *bitmap_header;
-    REFERENCE_TIME start_time, end_time;
+    REFERENCE_TIME start_time = 0, end_time = 0;
     VMR9PresentationInfo info = {};
     D3DLOCKED_RECT locked_rect;
     D3DSURFACE_DESC dst_desc;
@@ -273,8 +296,10 @@ static HRESULT vmr_render(struct strmbase_renderer *iface, IMediaSample *sample)
 
     info.rtStart = start_time;
     info.rtEnd = end_time;
-    info.szAspectRatio.cx = width;
-    info.szAspectRatio.cy = height;
+    info.rcSrc = filter->window.src;
+    info.rcDst = filter->window.dst;
+    info.szAspectRatio.cx = info.rcDst.right - info.rcDst.left;
+    info.szAspectRatio.cy = info.rcDst.bottom - info.rcDst.top;
     info.lpSurf = filter->surfaces[(++filter->cur_surface) % filter->num_surfaces];
 
     if (FAILED(hr = IDirect3DSurface9_GetDesc(info.lpSurf, &dst_desc)))
@@ -462,8 +487,10 @@ static void vmr_init_stream(struct strmbase_renderer *iface)
 static void vmr_start_stream(struct strmbase_renderer *iface)
 {
     struct quartz_vmr *filter = impl_from_IBaseFilter(&iface->filter.IBaseFilter_iface);
+    HRESULT hr;
 
-    IVMRImagePresenter9_StartPresenting(filter->presenter, filter->cookie);
+    if (FAILED(hr = IVMRImagePresenter9_StartPresenting(filter->presenter, filter->cookie)))
+        WARN("Failed to start presenting, hr %#lx.\n", hr);
 }
 
 static void vmr_stop_stream(struct strmbase_renderer *iface)
@@ -479,19 +506,35 @@ static void vmr_stop_stream(struct strmbase_renderer *iface)
 static HRESULT vmr_connect(struct strmbase_renderer *iface, const AM_MEDIA_TYPE *mt)
 {
     struct quartz_vmr *filter = impl_from_IBaseFilter(&iface->filter.IBaseFilter_iface);
-    const BITMAPINFOHEADER *bitmap_header = get_bitmap_header(mt);
+    const RECT *source_rect = get_source_rect(mt), *target_rect = get_target_rect(mt);
     HWND window = filter->window.hwnd;
     HRESULT hr;
     RECT rect;
 
-    SetRect(&rect, 0, 0, bitmap_header->biWidth, bitmap_header->biHeight);
-    filter->window.src = rect;
+    if (IsRectEmpty(source_rect))
+        get_native_video_rect(mt, &filter->window.src);
+    else
+        filter->window.src = *source_rect;
 
-    AdjustWindowRectEx(&rect, GetWindowLongW(window, GWL_STYLE), FALSE,
-            GetWindowLongW(window, GWL_EXSTYLE));
-    SetWindowPos(window, NULL, 0, 0, rect.right - rect.left, rect.bottom - rect.top,
-            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-    GetClientRect(window, &filter->window.dst);
+    if (!IsRectEmpty(target_rect))
+        filter->window.dst = *target_rect;
+    else if (filter->mode == VMR9Mode_Windowless && filter->clipping_window)
+        GetClientRect(filter->clipping_window, &filter->window.dst);
+    else
+        filter->window.dst = filter->window.src;
+
+    if (filter->mode == VMR9Mode_Windowed || !filter->mode)
+    {
+        rect = filter->window.dst;
+        if (IsRectEmpty(&rect))
+            get_native_video_rect(mt, &rect);
+
+        AdjustWindowRectEx(&rect, GetWindowLongW(window, GWL_STYLE), FALSE,
+                GetWindowLongW(window, GWL_EXSTYLE));
+        SetWindowPos(window, NULL, 0, 0, rect.right - rect.left, rect.bottom - rect.top,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        GetClientRect(window, &filter->window.dst);
+    }
 
     if (filter->mode
             || SUCCEEDED(hr = IVMRFilterConfig9_SetRenderingMode(&filter->IVMRFilterConfig9_iface, VMR9Mode_Windowed)))
@@ -518,6 +561,7 @@ static void deallocate_surfaces(struct quartz_vmr *filter)
 static void vmr_disconnect(struct strmbase_renderer *This)
 {
     struct quartz_vmr *filter = impl_from_IBaseFilter(&This->filter.IBaseFilter_iface);
+
     deallocate_surfaces(filter);
 }
 
@@ -2276,8 +2320,18 @@ static ULONG WINAPI VMR9_ImagePresenter_Release(IVMRImagePresenter9 *iface)
 static HRESULT WINAPI VMR9_ImagePresenter_StartPresenting(IVMRImagePresenter9 *iface, DWORD_PTR cookie)
 {
     struct default_presenter *presenter = impl_from_IVMRImagePresenter9(iface);
+    HRESULT hr;
 
     TRACE("presenter %p, cookie %#Ix.\n", presenter, cookie);
+
+    if (!presenter->d3d9_dev)
+        return VFW_E_WRONG_STATE;
+
+    if (FAILED(hr = IDirect3DDevice9_TestCooperativeLevel(presenter->d3d9_dev)))
+    {
+        WARN("Device is not ready, hr %#lx.\n", hr);
+        return hr;
+    }
 
     return S_OK;
 }
@@ -2297,23 +2351,52 @@ static HRESULT WINAPI VMR9_ImagePresenter_PresentImage(IVMRImagePresenter9 *ifac
     struct default_presenter *presenter = impl_from_IVMRImagePresenter9(iface);
     const struct quartz_vmr *filter = presenter->pVMR9;
     IDirect3DDevice9 *device = presenter->d3d9_dev;
-    const RECT src = filter->window.src;
+    RECT src = filter->window.src;
     IDirect3DSurface9 *backbuffer;
     RECT dst = filter->window.dst;
-    HRESULT hr;
+    HRESULT hr, ret = S_OK;
 
     TRACE("presenter %p, cookie %#Ix, info %p.\n", presenter, cookie, info);
+    TRACE("flags %#lx, surface %p, start %s, end %s, aspect ratio %ldx%ld,\n",
+            info->dwFlags, info->lpSurf, debugstr_time(info->rtStart),
+            debugstr_time(info->rtEnd), info->szAspectRatio.cx, info->szAspectRatio.cy);
+    TRACE("src %s, dst %s.\n", wine_dbgstr_rect(&info->rcSrc), wine_dbgstr_rect(&info->rcDst));
 
     /* This might happen if we don't have active focus (eg on a different virtual desktop) */
     if (!device)
         return S_OK;
 
+    if (info->dwFlags & VMR9Sample_SrcDstRectsValid)
+    {
+        if (!IsRectEmpty(&info->rcSrc))
+            src = info->rcSrc;
+        if (!IsRectEmpty(&info->rcDst))
+            dst = info->rcDst;
+    }
+
+    if (IsRectEmpty(&src))
+    {
+        D3DSURFACE_DESC desc;
+
+        if (FAILED(hr = IDirect3DSurface9_GetDesc(info->lpSurf, &desc)))
+            return hr;
+        SetRect(&src, 0, 0, desc.Width, desc.Height);
+    }
+    if (IsRectEmpty(&dst))
+        dst = src;
+
     if (FAILED(hr = IDirect3DDevice9_Clear(device, 0, NULL, D3DCLEAR_TARGET,
             D3DCOLOR_XRGB(0, 0, 0), 1.0f, 0)))
+    {
         ERR("Failed to clear, hr %#lx.\n", hr);
+        ret = hr;
+    }
 
     if (FAILED(hr = IDirect3DDevice9_BeginScene(device)))
+    {
         ERR("Failed to begin scene, hr %#lx.\n", hr);
+        ret = hr;
+    }
 
     if (FAILED(hr = IDirect3DDevice9_GetBackBuffer(device, 0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer)))
     {
@@ -2322,11 +2405,17 @@ static HRESULT WINAPI VMR9_ImagePresenter_PresentImage(IVMRImagePresenter9 *ifac
     }
 
     if (FAILED(hr = IDirect3DDevice9_StretchRect(device, info->lpSurf, NULL, backbuffer, NULL, D3DTEXF_POINT)))
+    {
         ERR("Failed to blit image, hr %#lx.\n", hr);
+        ret = hr;
+    }
     IDirect3DSurface9_Release(backbuffer);
 
     if (FAILED(hr = IDirect3DDevice9_EndScene(device)))
+    {
         ERR("Failed to end scene, hr %#lx.\n", hr);
+        ret = hr;
+    }
 
     if (filter->aspect_mode == VMR9ARMode_LetterBox)
     {
@@ -2354,9 +2443,12 @@ static HRESULT WINAPI VMR9_ImagePresenter_PresentImage(IVMRImagePresenter9 *ifac
     }
 
     if (FAILED(hr = IDirect3DDevice9_Present(device, &src, &dst, NULL, NULL)))
+    {
         ERR("Failed to present, hr %#lx.\n", hr);
+        ret = hr;
+    }
 
-    return S_OK;
+    return ret;
 }
 
 static const IVMRImagePresenter9Vtbl VMR9_ImagePresenter =
