@@ -236,6 +236,8 @@ void macdrv_make_context_current(macdrv_opengl_context c, macdrv_view v, CGRect 
 
     if (context && view)
     {
+        view = (NSView*)macdrv_view_get_opengl_view((macdrv_view)view);
+
         if (view == [context view] || view == [context latentView])
         {
             [context wine_updateBackingSize:&r.size];
@@ -244,7 +246,7 @@ void macdrv_make_context_current(macdrv_opengl_context c, macdrv_view v, CGRect 
         else
         {
             [context removeFromViews:NO];
-            macdrv_add_view_opengl_context(v, c);
+            macdrv_add_view_opengl_context((macdrv_view)view, c);
 
             if (context.needsUpdate)
             {

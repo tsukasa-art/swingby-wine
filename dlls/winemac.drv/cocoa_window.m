@@ -382,6 +382,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     int backingSize[2];
 
     WineMetalView *_metalView;
+    WineContentView *_glOverlayView;
 }
 
 @property (readonly, nonatomic) BOOL everHadGLContext;
@@ -389,6 +390,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     - (void) addGLContext:(WineOpenGLContext*)context;
     - (void) removeGLContext:(WineOpenGLContext*)context;
     - (void) updateGLContexts;
+    - (WineContentView*) openGLTargetView;
 
     - (void) wine_getBackingSize:(int*)outBackingSize;
     - (void) wine_setBackingSize:(const int*)newBackingSize;
@@ -705,6 +707,30 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         return _metalView;
     }
 
+    - (WineContentView*) openGLTargetView
+    {
+        if (!_metalView)
+            return self;
+
+        if (!_glOverlayView)
+        {
+            WineContentView *view = [[WineContentView alloc] initWithFrame:[self bounds]];
+
+            [view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+            [view setWantsBestResolutionOpenGLSurface:retina_on];
+            [self setAutoresizesSubviews:YES];
+            [self addSubview:view positioned:NSWindowAbove relativeTo:_metalView];
+            _glOverlayView = view;
+            [view release];
+        }
+        else if ([_glOverlayView superview] == self)
+        {
+            [self addSubview:_glOverlayView positioned:NSWindowAbove relativeTo:_metalView];
+        }
+
+        return _glOverlayView;
+    }
+
     - (void) setLayerRetinaProperties:(int)mode
     {
         [self layer].contentsScale = mode ? 2.0 : 1.0;
@@ -820,6 +846,8 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         }
         if (subview == _metalView)
             _metalView = nil;
+        if (subview == _glOverlayView)
+            _glOverlayView = nil;
         [super willRemoveSubview:subview];
     }
 
@@ -3873,6 +3901,21 @@ void macdrv_remove_view_opengl_context(macdrv_view v, macdrv_opengl_context c)
     OnMainThreadAsync(^{
         [view removeGLContext:context];
     });
+}
+}
+
+macdrv_view macdrv_view_get_opengl_view(macdrv_view v)
+{
+@autoreleasepool
+{
+    WineContentView* view = (WineContentView*)v;
+    __block WineContentView* ret = nil;
+
+    OnMainThread(^{
+        ret = [view openGLTargetView];
+    });
+
+    return (macdrv_view)ret;
 }
 }
 
