@@ -561,6 +561,36 @@ static HRESULT vmr_get_current_image(struct video_window *iface, LONG *size, LON
     return E_NOTIMPL;
 }
 
+static HRESULT WINAPI vmr_video_window_put_Owner(IVideoWindow *iface, OAHWND owner)
+{
+    struct vmr7 *filter = impl_from_video_window(CONTAINING_RECORD(iface, struct video_window, IVideoWindow_iface));
+    HRESULT hr;
+
+    TRACE("filter %p, owner %#Ix.\n", filter, owner);
+
+    hr = BaseControlWindowImpl_put_Owner(iface, owner);
+
+    if (SUCCEEDED(hr) && filter->mode == VMRMode_Windowed && owner && filter->allocator)
+    {
+        IVMRWindowlessControl *control;
+        HRESULT retarget_hr;
+
+        retarget_hr = IVMRSurfaceAllocator_QueryInterface(filter->allocator,
+                &IID_IVMRWindowlessControl, (void **)&control);
+        if (SUCCEEDED(retarget_hr))
+        {
+            retarget_hr = IVMRWindowlessControl_SetVideoClippingWindow(control, (HWND)owner);
+            if (FAILED(retarget_hr))
+                WARN("Failed to retarget VMR7 windowed clipping window, hr %#lx.\n", retarget_hr);
+            IVMRWindowlessControl_Release(control);
+        }
+        else
+            WARN("Failed to query VMR7 windowless control from allocator, hr %#lx.\n", retarget_hr);
+    }
+
+    return hr;
+}
+
 static const struct video_window_ops window_ops =
 {
     .get_default_rect = vmr_get_default_rect,
@@ -598,7 +628,7 @@ static const IVideoWindowVtbl IVideoWindow_VTable =
     BaseControlWindowImpl_get_Top,
     BaseControlWindowImpl_put_Height,
     BaseControlWindowImpl_get_Height,
-    BaseControlWindowImpl_put_Owner,
+    vmr_video_window_put_Owner,
     BaseControlWindowImpl_get_Owner,
     BaseControlWindowImpl_put_MessageDrain,
     BaseControlWindowImpl_get_MessageDrain,

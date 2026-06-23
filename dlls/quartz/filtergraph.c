@@ -4176,11 +4176,16 @@ static HRESULT WINAPI VideoWindow_put_Visible(IVideoWindow *iface, LONG Visible)
     EnterCriticalSection(&This->cs);
 
     hr = GetTargetInterface(This, &IID_IVideoWindow, (LPVOID*)&pVideoWindow);
-
     if (hr == S_OK)
-        hr = IVideoWindow_put_Visible(pVideoWindow, Visible);
+        IVideoWindow_AddRef(pVideoWindow);
 
     LeaveCriticalSection(&This->cs);
+
+    if (hr == S_OK)
+    {
+        hr = IVideoWindow_put_Visible(pVideoWindow, Visible);
+        IVideoWindow_Release(pVideoWindow);
+    }
 
     return hr;
 }
@@ -4564,11 +4569,16 @@ static HRESULT WINAPI VideoWindow_NotifyOwnerMessage(IVideoWindow *iface, OAHWND
     EnterCriticalSection(&This->cs);
 
     hr = GetTargetInterface(This, &IID_IVideoWindow, (LPVOID*)&pVideoWindow);
-
     if (hr == S_OK)
-        hr = IVideoWindow_NotifyOwnerMessage(pVideoWindow, hwnd, uMsg, wParam, lParam);
+        IVideoWindow_AddRef(pVideoWindow);
 
     LeaveCriticalSection(&This->cs);
+
+    if (hr == S_OK)
+    {
+        hr = IVideoWindow_NotifyOwnerMessage(pVideoWindow, hwnd, uMsg, wParam, lParam);
+        IVideoWindow_Release(pVideoWindow);
+    }
 
     return hr;
 }
