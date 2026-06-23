@@ -408,6 +408,16 @@ static HRESULT WINAPI device_manager_processor_service_CreateSurface(IDirectXVid
 
     for (i = 0; i < backbuffers + 1; ++i)
     {
+        /* Video processor render targets must be usable as Direct3D render targets so the
+         * processor can ColorFill/StretchRect into them. Plain offscreen surfaces are not
+         * color-renderable on stricter backends (e.g. macOS GL FBO completeness), which
+         * silently breaks presentation. Create a real render target, falling back to a plain
+         * surface for formats that cannot be render targets (e.g. packed YUV like YUY2). */
+        if (dxvaType == DXVA2_VideoProcessorRenderTarget && pool == D3DPOOL_DEFAULT
+                && SUCCEEDED(hr = IDirect3DDevice9_CreateRenderTarget(manager->device, width, height,
+                        format, D3DMULTISAMPLE_NONE, 0, TRUE, &surfaces[i], NULL)))
+            continue;
+
         if (FAILED(hr = IDirect3DDevice9_CreateOffscreenPlainSurface(manager->device, width, height, format,
                 pool, &surfaces[i], NULL)))
             break;
