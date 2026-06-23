@@ -279,6 +279,32 @@ static HRESULT vmr_render(struct strmbase_renderer *iface, IMediaSample *sample)
         copy_plane(&dst, surface_desc.lPitch / 2, surface_desc.dwHeight / 2, &src, src_pitch / 2, height / 2);
         copy_plane(&dst, surface_desc.lPitch / 2, surface_desc.dwHeight / 2, &src, src_pitch / 2, height / 2);
     }
+    else if (bitmap_header->biCompression == BI_RGB && depth == 24)
+    {
+        /* The presenter always allocates a 32bpp (X8R8G8B8) surface, so 24bpp
+         * BGR samples must be widened to 32bpp BGRX per pixel — a plain row
+         * copy would shift every pixel (3 vs 4 bytes). A positive biHeight is
+         * a bottom-up DIB, so invert rows into the top-down surface. Fixes the
+         * black NeXAS-engine movie whose RGB24 SampleGrabber output
+         * could not be allocated as a surface before. */
+        unsigned int abs_height = abs(height);
+        BOOL bottom_up = (height > 0);
+        unsigned int y, x;
+
+        for (y = 0; y < abs_height; ++y)
+        {
+            const BYTE *src_row = data + (bottom_up ? (abs_height - 1 - y) : y) * src_pitch;
+            BYTE *dst_row = (BYTE *)surface_desc.lpSurface + y * surface_desc.lPitch;
+
+            for (x = 0; x < width; ++x)
+            {
+                dst_row[x * 4 + 0] = src_row[x * 3 + 0];
+                dst_row[x * 4 + 1] = src_row[x * 3 + 1];
+                dst_row[x * 4 + 2] = src_row[x * 3 + 2];
+                dst_row[x * 4 + 3] = 0xff;
+            }
+        }
+    }
     else if (height > 0 && bitmap_header->biCompression == BI_RGB)
     {
         BYTE *dst = surface_desc.lpSurface;

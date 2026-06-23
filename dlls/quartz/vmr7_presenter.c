@@ -192,12 +192,18 @@ static HRESULT WINAPI surface_allocator_AllocateSurface(IVMRSurfaceAllocator *if
 
     if (info->lpHdr->biCompression == BI_RGB)
     {
-        if (info->lpHdr->biBitCount != 32)
+        if (info->lpHdr->biBitCount != 32 && info->lpHdr->biBitCount != 24)
         {
             FIXME("Unhandled bit depth %u.\n", info->lpHdr->biBitCount);
             return E_NOTIMPL;
         }
 
+        /* Always allocate a 32-bit (X8R8G8B8) surface, even for 24-bit RGB
+         * input: wined3d/MoltenVK has no usable 24-bit (R8G8B8) offscreen
+         * surface format. 24-bit samples are widened to 32 bpp per pixel on
+         * copy (see vmr_render() in vmr7.c). NeXAS-engine movies
+         * deliver RGB24 through a SampleGrabber, which previously failed here
+         * with E_NOTIMPL -> no surface -> black movie. */
         surface_desc.ddpfPixelFormat.dwFlags = DDPF_RGB;
         surface_desc.ddpfPixelFormat.dwRGBBitCount = 32;
         surface_desc.ddpfPixelFormat.dwRBitMask = 0x00ff0000;
