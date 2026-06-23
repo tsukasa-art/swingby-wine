@@ -562,6 +562,7 @@ extern void macdrv_set_view_hidden(macdrv_view v, int hidden);
 extern void macdrv_add_view_opengl_context(macdrv_view v, macdrv_opengl_context c);
 extern void macdrv_remove_view_opengl_context(macdrv_view v, macdrv_opengl_context c);
 extern macdrv_view macdrv_view_get_opengl_view(macdrv_view v);
+extern void macdrv_view_note_opengl_flush(macdrv_view v);
 extern macdrv_metal_device macdrv_create_metal_device(void);
 extern void macdrv_release_metal_device(macdrv_metal_device d);
 extern macdrv_metal_view macdrv_view_create_metal_view(macdrv_view v, macdrv_metal_device d);

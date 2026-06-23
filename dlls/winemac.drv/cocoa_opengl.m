@@ -338,6 +338,8 @@ void macdrv_flush_opengl_context(macdrv_opengl_context c)
     WineOpenGLContext *context = (WineOpenGLContext*)c;
 
     macdrv_update_opengl_context(c);
+    if ([context view])
+        macdrv_view_note_opengl_flush((macdrv_view)[context view]);
     [context flushBuffer];
 }
 }

@@ -375,9 +375,11 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     BOOL _everHadGLContext;
     BOOL _cachedHasGLDescendant;
     BOOL _cachedHasGLDescendantValid;
+    BOOL _isGLOverlayView;
 
     NSMutableAttributedString* markedText;
     NSRange markedTextSelection;
+    NSTimer *_glOverlayHideTimer;
 
     int backingSize[2];
 
@@ -391,6 +393,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     - (void) removeGLContext:(WineOpenGLContext*)context;
     - (void) updateGLContexts;
     - (WineContentView*) openGLTargetView;
+    - (void) noteOpenGLFlush;
 
     - (void) wine_getBackingSize:(int*)outBackingSize;
     - (void) wine_setBackingSize:(const int*)newBackingSize;
@@ -501,6 +504,8 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
     - (void) dealloc
     {
+        [_glOverlayHideTimer invalidate];
+        [_glOverlayHideTimer release];
         [markedText release];
         [glContexts release];
         [pendingGlContexts release];
@@ -625,6 +630,8 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     {
         [glContexts removeObjectIdenticalTo:context];
         [pendingGlContexts removeObjectIdenticalTo:context];
+        if (_isGLOverlayView && ![glContexts count] && ![pendingGlContexts count])
+            [self hideOpenGLOverlay:_glOverlayHideTimer];
         [(WineWindow*)[self window] updateForGLSubviews];
     }
 
@@ -716,8 +723,10 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         {
             WineContentView *view = [[WineContentView alloc] initWithFrame:[self bounds]];
 
+            view->_isGLOverlayView = TRUE;
             [view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
             [view setWantsBestResolutionOpenGLSurface:retina_on];
+            [view setHidden:YES];
             [self setAutoresizesSubviews:YES];
             [self addSubview:view positioned:NSWindowAbove relativeTo:_metalView];
             _glOverlayView = view;
@@ -725,10 +734,49 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         }
         else if ([_glOverlayView superview] == self)
         {
+            [_glOverlayView setFrame:[self bounds]];
             [self addSubview:_glOverlayView positioned:NSWindowAbove relativeTo:_metalView];
         }
 
         return _glOverlayView;
+    }
+
+    - (void) hideOpenGLOverlay:(NSTimer *)timer
+    {
+        if (timer != _glOverlayHideTimer)
+            return;
+
+        [_glOverlayHideTimer release];
+        _glOverlayHideTimer = nil;
+        [self setHidden:YES];
+        [(WineWindow*)self.window updateForGLSubviews];
+    }
+
+    - (void) noteOpenGLFlush
+    {
+        WineContentView *superview;
+
+        if (!_isGLOverlayView)
+            return;
+
+        superview = (WineContentView *)[self superview];
+        if ([superview isKindOfClass:[WineContentView class]] && superview->_glOverlayView == self)
+        {
+            [self setFrame:[superview bounds]];
+            if (superview->_metalView)
+                [superview addSubview:self positioned:NSWindowAbove relativeTo:superview->_metalView];
+        }
+
+        [_glOverlayHideTimer invalidate];
+        [_glOverlayHideTimer release];
+        _glOverlayHideTimer = [[NSTimer scheduledTimerWithTimeInterval:0.20
+                target:self selector:@selector(hideOpenGLOverlay:) userInfo:nil repeats:NO] retain];
+
+        if ([self isHidden])
+        {
+            [self setHidden:NO];
+            [(WineWindow*)self.window updateForGLSubviews];
+        }
     }
 
     - (void) setLayerRetinaProperties:(int)mode
@@ -3916,6 +3964,18 @@ macdrv_view macdrv_view_get_opengl_view(macdrv_view v)
     });
 
     return (macdrv_view)ret;
+}
+}
+
+void macdrv_view_note_opengl_flush(macdrv_view v)
+{
+@autoreleasepool
+{
+    WineContentView* view = (WineContentView*)v;
+
+    OnMainThread(^{
+        [view noteOpenGLFlush];
+    });
 }
 }
 
