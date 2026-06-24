@@ -1,8 +1,12 @@
 # swingby-wine
 
-A personal Wine fork targeting macOS (Apple Silicon / Rosetta 2), built for use with the [Melammu](https://github.com/tsukasa-art/Wukiyo) launcher. Based on the [WineHQ](https://gitlab.winehq.org/wine/wine) **Wine 10.0 release** (`b0738596`), it carries this fork's own macOS/Rosetta compatibility patches. This repository is the source of truth for Melammu's bundled Wine runtime; WineHQ is the upstream to rebase onto.
+A personal Wine fork targeting macOS (Apple Silicon / Rosetta 2), built for use with the [Melammu](https://github.com/tsukasa-art/melammu-vn) launcher. Part of **Orrery** — a macOS compatibility layer for Windows visual novels. Based on the [WineHQ](https://gitlab.winehq.org/wine/wine) **Wine 10.0 release** (`b0738596`), it carries this fork's own macOS/Rosetta compatibility patches. This repository is the source of truth for Melammu's bundled Wine runtime; WineHQ is the upstream to rebase onto.
 
 Inspired by the macOS Wine work of [Sikarugir](https://github.com/Sikarugir-App/Creator) (formerly Kegworks). See [SWINGBY_PATCHES.md](SWINGBY_PATCHES.md) for the responsibility boundary and patch classification.
+
+## Runtime dependency
+
+x86→ARM translation currently relies on Rosetta 2. How long it stays available on Apple Silicon — and on what terms — is an open question, so reducing this dependency is a known long-term concern, not a solved one.
 
 ## Patches
 
@@ -81,7 +85,7 @@ D3DMetal (Apple GPTK) covers D3D11/D3D12/DXGI/DDraw but **not** D3D9; d9vk remai
 
 ## Related
 
-- [Melammu](https://github.com/tsukasa-art/Wukiyo) — macOS launcher and HUD that drives the thumbnail injection
+- [Melammu](https://github.com/tsukasa-art/melammu-vn) — macOS launcher and HUD that drives the thumbnail injection
 - [Sikarugir](https://github.com/Sikarugir-App/Creator) — macOS Wine work that inspired this project
 - [Zenn: Mac で美少女ゲームを動かす](https://zenn.dev/tsukasa_art/articles/mac-eroge-compat-part1) — series documenting the compatibility work
 
