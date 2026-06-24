@@ -1706,6 +1706,31 @@ static HRESULT ddraw_surface_blt_clipped(struct ddraw_surface *dst_surface, cons
         }
     }
 
+    /* Some drivers back the DirectDraw swapchain with a child/native drawable
+     * that leaves the clipper's window region empty (GetClipList() yields zero
+     * rects) even though the windowed primary still needs to be flushed, so the
+     * clipped loop above never blits or flushes and content drawn to the primary
+     * (e.g. a windowed VMR7 video frame) never reaches the screen. Fall back to
+     * the unclipped destination rect, but only for a visible, non-iconic
+     * windowed primary that flushes to its own swapchain window: an empty clip
+     * list in exclusive mode or for a genuinely hidden/occluded window is a
+     * legitimate "nothing to draw" result and must keep the no-op behaviour. */
+    if (!clip_list->rdh.nCount
+            && (dst_surface->surface_desc.ddsCaps.dwCaps & DDSCAPS_PRIMARYSURFACE)
+            && dst_surface->ddraw->swapchain_window
+            && dst_surface->clipper->window == dst_surface->ddraw->swapchain_window
+            && !(dst_surface->ddraw->cooperative_level & DDSCL_EXCLUSIVE)
+            && IsWindowVisible(dst_surface->clipper->window)
+            && !IsIconic(dst_surface->clipper->window))
+    {
+        if (src_surface && (src_surface->surface_desc.ddsCaps.dwCaps & DDSCAPS_PRIMARYSURFACE))
+            hr = ddraw_surface_update_frontbuffer(src_surface, &src_rect, TRUE, 0);
+        if (SUCCEEDED(hr))
+            hr = ddraw_surface_blt(dst_surface, &dst_rect, src_surface, &src_rect, flags, fill_colour, fx, filter);
+        if (SUCCEEDED(hr))
+            hr = ddraw_surface_update_frontbuffer(dst_surface, &dst_rect, FALSE, 0);
+    }
+
     free(clip_list);
     return hr;
 }
