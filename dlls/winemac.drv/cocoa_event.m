@@ -491,6 +491,16 @@ void OnMainThread(dispatch_block_t block)
 {
 @autoreleasepool
 {
+    /* If we're already on the main thread, run the block inline.  Dispatching
+     * to the main thread and waiting would deadlock against ourselves (e.g.
+     * macdrv_update_opengl_context() called from -[WineContentView viewWillDraw]
+     * on the main thread). */
+    if ([NSThread isMainThread])
+    {
+        block();
+        return;
+    }
+
     NSMutableDictionary* threadDict = [[NSThread currentThread] threadDictionary];
     WineEventQueue* queue = threadDict[WineEventQueueThreadDictionaryKey];
     dispatch_semaphore_t semaphore = NULL;
