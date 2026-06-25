@@ -436,6 +436,17 @@ static HRESULT WINAPI video_processor_GetOutputAvailableType(IMFTransform *iface
         goto done;
     if (FAILED(hr = IMFMediaType_SetUINT64(media_type, &MF_MT_FRAME_SIZE, frame_size)))
         goto done;
+    /* Mark the output as uncompressed: MFT_OUTPUT types from this processor are raw
+     * video frames.  mfplat derives IsCompressedFormat() purely from
+     * MF_MT_ALL_SAMPLES_INDEPENDENT, and the EVR mixer's SetInputType rejects any type
+     * it considers compressed (video_mixer_init_dxva_videodesc).  Without these the
+     * processor's output types are taken for compressed and the mixer refuses them,
+     * breaking topology resolution for sinks fed through this processor.  Matches
+     * color_convert's transform_GetOutputAvailableType. */
+    if (FAILED(hr = IMFMediaType_SetUINT32(media_type, &MF_MT_FIXED_SIZE_SAMPLES, 1)))
+        goto done;
+    if (FAILED(hr = IMFMediaType_SetUINT32(media_type, &MF_MT_ALL_SAMPLES_INDEPENDENT, 1)))
+        goto done;
 
     IMFMediaType_AddRef((*type = media_type));
 
