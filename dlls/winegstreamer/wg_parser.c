@@ -1798,6 +1798,17 @@ static BOOL decodebin_parser_init_gst(struct wg_parser *parser)
     gst_bin_add(GST_BIN(parser->container), element);
     parser->decodebin = element;
 
+    /* High-bitrate movies (e.g. ハミダシ OP: 720p WMV3 ~17Mbps, motion bursts to ~42Mbps)
+     * fill decodebin's internal multiqueue byte ceiling (~8MB) on the video stream within
+     * ~1.5s. The demuxer then blocks pushing into the full video queue (gst_multi_queue_chain
+     * → pthread_cond_wait), and since A/V are demuxed interleaved it cannot read the next
+     * audio packets — the audio queue drains to empty and the audio renderer starves (~1.1s
+     * silence + a permanent A/V offset). Raise the limit and make it time-bounded so a
+     * transient high-bitrate video burst no longer blocks audio demux.
+     * See research/evidence/2026-06-26-hamidashi-OP-audio-starvation-findings.md §②-4. */
+    g_object_set(element, "max-size-time", (guint64)(5 * GST_SECOND),
+            "max-size-bytes", (guint)(64 * 1024 * 1024), "max-size-buffers", (guint)0, NULL);
+
     g_signal_connect(element, "pad-added", G_CALLBACK(pad_added_cb), parser);
     g_signal_connect(element, "pad-removed", G_CALLBACK(pad_removed_cb), parser);
     g_signal_connect(element, "autoplug-continue", G_CALLBACK(autoplug_continue_cb), parser);
