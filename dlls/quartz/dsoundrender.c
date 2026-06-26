@@ -181,6 +181,20 @@ static HRESULT get_write_pos(struct dsound_render *filter,
         goto end;
     }
 
+    /* At movie start under Wine the reference clock has not yet reached
+     * stream_start (cur < 0), so the first sample (write_at ~= 0) is judged
+     * "too far ahead" and ~0.18s of silence is inserted to honour its
+     * timestamp, leaving audio permanently lagging the freely-running video
+     * (measured Artemis logo: writepos_t=-0.182 / write_at=0.0 →
+     * 2026-06-26-hamidashi-logo-get-write-pos-decode.txt). Native does not
+     * exhibit this. During this pre-roll window render the sample immediately
+     * (continuous) instead of advancing, aligning audio to video. */
+    if (cur < 0)
+    {
+        *ret_writepos = writepos;
+        goto end;
+    }
+
     if (writepos >= playpos)
         writepos_t = cur + time_from_pos(filter, writepos - playpos);
     else
