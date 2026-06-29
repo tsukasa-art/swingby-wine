@@ -495,10 +495,31 @@ HRESULT primarybuffer_SetFormat(DirectSoundDevice *device, LPCWAVEFORMATEX passe
 		} else
 			free(old_fmt);
 	} else {
+		WAVEFORMATEX *old_fmt = device->primary_pwfx;
 		WAVEFORMATEX *wfx = DSOUND_CopyFormat(passed_fmt);
 		if (wfx) {
-			free(device->primary_pwfx);
 			device->primary_pwfx = wfx;
+
+			/* swingby: in shared (non-WRITEPRIMARY) mode the primary format is
+			 * advisory and the mixer otherwise runs at the device mix rate,
+			 * forcing dsound's own resampler. When the app requests a STRICTLY
+			 * HIGHER rate than the current device rate (e.g. 48000 content on a
+			 * 44100 device), honor it as the device rate: the mix then runs at
+			 * the content rate and CoreAudio/AUHAL performs the final (high
+			 * quality) sample-rate conversion to hardware, avoiding dsound's
+			 * lower-quality resampler. Only when strictly higher, to avoid
+			 * pointless up-then-down resampling; keep prior behavior on failure. */
+			if (device->pwfx &&
+			    wfx->nSamplesPerSec > device->pwfx->nSamplesPerSec) {
+				HRESULT rehr = DSOUND_ReopenDevice(device, TRUE);
+				if (FAILED(rehr)) {
+					WARN("swingby: honor-higher-rate reopen failed: %08lx, keeping device rate\n", rehr);
+					device->primary_pwfx = old_fmt;
+					free(wfx);
+				} else
+					free(old_fmt);
+			} else
+				free(old_fmt);
 		} else
 			err = DSERR_OUTOFMEMORY;
 	}
