@@ -135,12 +135,32 @@ HRESULT ddraw_surface_update_frontbuffer(struct ddraw_surface *surface,
         else
             dst_texture = wined3d_swapchain_get_front_buffer(ddraw->wined3d_swapchain);
 
-        if (SUCCEEDED(hr = wined3d_device_context_blt(ddraw->immediate_context, dst_texture, 0, rect,
+        hr = wined3d_device_context_blt(ddraw->immediate_context, dst_texture, 0, rect,
                 ddraw_surface_get_any_texture(surface, DDRAW_SURFACE_READ), surface->sub_resource_idx, rect, 0,
-                NULL, WINED3D_TEXF_POINT)) && swap_interval)
+                NULL, WINED3D_TEXF_POINT);
+        if (SUCCEEDED(hr) && swap_interval)
         {
             hr = wined3d_swapchain_present(ddraw->wined3d_swapchain, rect, rect, NULL, swap_interval, 0);
             ddraw->flags |= DDRAW_SWAPPED;
+        }
+
+        /* macOS: ddraw/VMR-7 movies blit straight to the front-buffer drawable
+         * (no wglSwapBuffers). When the main scene is DXVK/Metal the GL drawable
+         * is a hidden overlay child view, so the winemac overlay never un-hides
+         * and the movie stays white. Fire the overlay un-hide. No-op when the
+         * context view is not a GL overlay (plain wined3d GL engines unaffected). */
+        {
+            typedef void (WINAPI *NOTE_FLUSH_FN)(HWND);
+            static NOTE_FLUSH_FN note_flush = NULL;
+            static BOOL note_flush_resolved = FALSE;
+            if (!note_flush_resolved)
+            {
+                HMODULE mac_drv = GetModuleHandleA("winemac.drv");
+                note_flush = mac_drv ? (NOTE_FLUSH_FN)GetProcAddress(mac_drv, "WineMacNoteFrontbufferFlush") : NULL;
+                note_flush_resolved = TRUE;
+            }
+            if (note_flush)
+                note_flush(ddraw->swapchain_window);
         }
         return hr;
     }

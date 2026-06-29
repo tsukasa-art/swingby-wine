@@ -24,6 +24,7 @@ enum macdrv_funcs
     unix_init,
     unix_quit_result,
     unix_capture_window_pixels,
+    unix_note_frontbuffer_flush,
     unix_funcs_count
 };
 
@@ -33,6 +34,12 @@ struct capture_window_pixels_params
     UINT64 hwnd;
     UINT64 buf;
     UINT   w, h, row_pitch;
+};
+
+/* macdrv_note_frontbuffer_flush params */
+struct note_frontbuffer_flush_params
+{
+    UINT64 hwnd;
 };
 
 #define MACDRV_CALL(func, params) WINE_UNIX_CALL(unix_ ## func, params)

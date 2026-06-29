@@ -417,6 +417,16 @@ void WINAPI WineMacCaptureWindowPixelsBGRA(HWND hwnd, void *buf,
     MACDRV_CALL(capture_window_pixels, &params);
 }
 
+/* Un-hide the GL-over-Metal overlay for the current thread's GL context
+ * without swapping buffers. Called by wined3d's front-buffer (ddraw/VMR-7)
+ * movie present so the movie becomes visible over the DXVK/Metal main scene. */
+void WINAPI WineMacNoteFrontbufferFlush(HWND hwnd)
+{
+    struct note_frontbuffer_flush_params params;
+    params.hwnd = (UINT_PTR)hwnd;
+    MACDRV_CALL(note_frontbuffer_flush, &params);
+}
+
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
 {
     if (reason != DLL_PROCESS_ATTACH) return TRUE;

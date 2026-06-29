@@ -738,6 +738,21 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
             [self addSubview:_glOverlayView positioned:NSWindowAbove relativeTo:_metalView];
         }
 
+        /* openGLTargetView runs on the main thread and blocks the caller (the
+         * wined3d/GL render thread, via macdrv_view_get_opengl_view's
+         * OnMainThread) until it returns. The GL drawable's surface only
+         * allocates once the overlay is on-screen, so un-hide it HERE, before
+         * the render — otherwise the first frames (e.g. the startup logo, whose
+         * 200ms graph init delay is skipped) render into an incomplete FBO and
+         * come out black. The 0.20s hide timer in noteOpenGLFlush still governs
+         * hiding when GL presentation goes idle. */
+        if ([_glOverlayView isHidden])
+        {
+            [_glOverlayView setFrame:[self bounds]];
+            [_glOverlayView setHidden:NO];
+            [(WineWindow*)self.window updateForGLSubviews];
+        }
+
         return _glOverlayView;
     }
 

@@ -4660,6 +4660,35 @@ NTSTATUS macdrv_capture_window_pixels(void *arg)
     return 0;
 }
 
+/**********************************************************************
+ *              macdrv_note_frontbuffer_flush
+ *
+ * Unix-call handler for the WineMacNoteFrontbufferFlush PE export.
+ * Un-hides the GL-over-Metal overlay for the calling thread's current GL
+ * context WITHOUT swapping buffers (front-buffer movie present is already on
+ * screen). Used by wined3d's swapchain_frontbuffer_updated so VMR-7/ddraw
+ * movies become visible when the main scene is DXVK/Metal. No-op when the
+ * context's view is not a GL overlay (i.e. no Metal main view), so engines
+ * whose main scene is plain wined3d GL (giga/cs2) are unaffected. */
+NTSTATUS macdrv_note_frontbuffer_flush(void *arg)
+{
+    struct note_frontbuffer_flush_params *params = arg;
+    HWND hwnd = (HWND)(UINT_PTR)params->hwnd;
+    struct macdrv_win_data *data;
+    macdrv_view client_view = NULL, overlay = NULL;
+
+    if ((data = get_win_data(hwnd)))
+    {
+        client_view = data->client_cocoa_view;
+        if (client_view)
+            overlay = macdrv_view_get_opengl_view(client_view);
+        release_win_data(data);
+    }
+    if (overlay)
+        macdrv_view_note_opengl_flush(overlay);
+    return 0;
+}
+
 /***********************************************************************
  *              macdrv_wglGetProcAddress
  */
