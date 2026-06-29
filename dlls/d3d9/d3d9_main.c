@@ -39,6 +39,11 @@ IDirect3D9 * WINAPI DECLSPEC_HOTPATCH Direct3DCreate9(UINT sdk_version)
       if (f) { fprintf(f, "Direct3DCreate9 sdk=%u\n", sdk_version); fclose(f); }
       else { FILE *f2 = fopen("Z:\\tmp\\swingby_d3d9_loaded.txt", "a");
              if (f2) { fprintf(f2, "Direct3DCreate9 via Z: sdk=%u\n", sdk_version); fclose(f2); } } }
+    /* Build-id marker: proves WHICH d3d9 the game actually loaded (bundle builtin
+     * vs a stale prefix native copy).  Overwrite each load so the file reflects the
+     * most recently loaded d3d9.  This string exists ONLY in this build. */
+    { FILE *bm = fopen("Z:\\tmp\\swingby_d3d9_build.txt", "wb");
+      if (bm) { fprintf(bm, "BUILD=2026-06-29-handshake-REVC sdk=%u\n", sdk_version); fclose(bm); } }
 
     TRACE("sdk_version %#x.\n", sdk_version);
 

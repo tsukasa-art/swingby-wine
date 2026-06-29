@@ -377,6 +377,32 @@ static void swingby_blit(void *dst_data, unsigned int dst_pitch,
     }
 }
 
+static void swingby_blit_scaled(void *dst_data, unsigned int dst_pitch,
+    unsigned int dst_w, unsigned int dst_h,
+    const BYTE *src_px, unsigned int src_fw, unsigned int src_fh, unsigned int src_fstride)
+{
+    unsigned int dy, dx;
+
+    if (!dst_data || !src_px || !dst_w || !dst_h || !src_fw || !src_fh)
+        return;
+
+    for (dy = 0; dy < dst_h; dy++)
+    {
+        unsigned int sy = (unsigned int)((UINT64)dy * src_fh / dst_h);
+        const BYTE *src = src_px + (SIZE_T)sy * src_fstride;
+        BYTE *dst = (BYTE *)dst_data + (SIZE_T)dy * dst_pitch;
+
+        for (dx = 0; dx < dst_w; dx++)
+        {
+            unsigned int sx = (unsigned int)((UINT64)dx * src_fw / dst_w);
+            dst[dx * 4 + 0] = src[sx * 4 + 0];
+            dst[dx * 4 + 1] = src[sx * 4 + 1];
+            dst[dx * 4 + 2] = src[sx * 4 + 2];
+            dst[dx * 4 + 3] = 0xFF;
+        }
+    }
+}
+
 /* Surface pointer set by StretchRect; cleared after one-shot injection. */
 static IDirect3DSurface9 *s_inject_pending_surf = NULL;
 static DWORD               s_inject_pending_tick = 0;
@@ -1187,10 +1213,10 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
         locked_rect->Pitch = map_desc.row_pitch;
         locked_rect->pBits = map_desc.data;
 
-        /* Melammu CMVS save-thumbnail capture: only when explicitly enabled by
-         * the launcher (MELAMMU_CMVS_THUMBS=1).  When OFF this whole block is
+        /* Melammu D3D9 thumbnail readback workaround: only when explicitly enabled by
+         * the launcher (MELAMMU_D3D9_THUMB_READBACK=1).  When OFF this whole block is
          * skipped so LockRect is byte-for-byte stock wine — required so the
-         * last-presented serve below never corrupts non-CMVS games' back-buffer
+         * last-presented serve below never corrupts non-target games' back-buffer
          * READONLY locks (the KiriKiri Z white-screen). */
         if (swingby_capture_is_enabled())
         {
@@ -1297,6 +1323,48 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
                 unsigned long avg = swingby_log_lock_sample("LOCK_SAMPLE", iface, &desc, rect, flags, &map_desc);
                 swingby_diag("LOCK_MAP surf=%p flags=0x%lx map_avg=%lu",
                         (void *)iface, (unsigned long)flags, avg);
+                if (iface == s_rtdata_dst_surf && s_rtdata_tick
+                        && (DWORD)(GetTickCount() - s_rtdata_tick) < 5000
+                        && avg != (unsigned long)-1 && avg <= 4
+                        && map_desc.row_pitch >= desc.width * 4)
+                {
+                    if (s_lastpres_frame && s_lastpres_w && s_lastpres_h)
+                    {
+                        swingby_blit_scaled(map_desc.data, map_desc.row_pitch,
+                                desc.width, desc.height, s_lastpres_frame,
+                                s_lastpres_w, s_lastpres_h, s_lastpres_stride);
+                        avg = swingby_log_lock_sample("LOCK_RTDATA_LASTPRES_INJECT",
+                                iface, &desc, rect, flags, &map_desc);
+                        swingby_diag("RTDATA_LASTPRES_INJECT surf=%p %ux%u src=%ux%u avg_after=%lu",
+                                (void *)iface, desc.width, desc.height,
+                                s_lastpres_w, s_lastpres_h, avg);
+                    }
+
+                    if (avg == (unsigned long)-1 || avg <= 4)
+                    {
+                        BYTE *px = NULL;
+                        unsigned int fw = 0, fh = 0, fstride = 0;
+
+                        /* Fallback only.  Prefer the in-process last-presented
+                         * copy above; the snap file can race save-screen timing. */
+                        swingby_free_pix_cache();
+                        if (swingby_load_snap_file("Z:\\tmp\\melammu_snap.bgra", &px, &fw, &fh, &fstride))
+                        {
+                            swingby_blit_scaled(map_desc.data, map_desc.row_pitch,
+                                    desc.width, desc.height, px, fw, fh, fstride);
+                            avg = swingby_log_lock_sample("LOCK_RTDATA_SNAP_INJECT",
+                                    iface, &desc, rect, flags, &map_desc);
+                            swingby_diag("RTDATA_SNAP_INJECT surf=%p %ux%u src=%ux%u avg_after=%lu",
+                                    (void *)iface, desc.width, desc.height,
+                                    fw, fh, avg);
+                        }
+                        else
+                        {
+                            swingby_diag("RTDATA_INJECT_SKIP no last-present/snap surf=%p",
+                                    (void *)iface);
+                        }
+                    }
+                }
                 if (!(flags & D3DLOCK_READONLY))
                 {
                     /* Write lock: sample again at UnlockRect to see what the

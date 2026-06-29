@@ -107,11 +107,25 @@ static BOOL swingby_present_capture_is_enabled(void)
     return cached;
 }
 
+/* Logging-only gate.  MELAMMU_D3D9_DIAG=1 enables the diag trace WITHOUT the
+ * per-Present back-buffer capture or any serve/inject — purely observational,
+ * safe to set on a working game (e.g. bgi32) to record its readback API path. */
+static BOOL swingby_diag_only_is_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *e = getenv("MELAMMU_D3D9_DIAG");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
 void swingby_diag(const char *fmt, ...)
 {
     FILE *f;
     va_list ap;
-    if (!swingby_present_capture_is_enabled())
+    if (!swingby_present_capture_is_enabled() && !swingby_diag_only_is_enabled())
         return;
     f = fopen("Z:\\tmp\\swingby_diag.txt", "a");
     if (!f) return;
@@ -2041,14 +2055,40 @@ static HRESULT WINAPI d3d9_device_GetRenderTargetData(IDirect3DDevice9Ex *iface,
             extern void swingby_on_get_render_target_data(IDirect3DSurface9 *s, IDirect3DSurface9 *d);
             swingby_on_get_render_target_data(render_target, dst_surface);
 
-            /* DISABLED on macOS 26 (2026-06-29): swingby_capture_rt_to_snap GPU-blts
-             * the RT into melammu_snap.bgra, but GPU readback is black for Wine's
-             * CAMetalLayer.  Firing it here (the Hamidashi save GetRenderTargetData
-             * path) wrote a black snap at the exact save moment, clobbering the
-             * launcher's ScreenCaptureKit snap and feeding the RTDATA inject black.
-             * The launcher (LibraryViewModel.captureDisplaySCK) is the sole snap
-             * writer now; d3d9 only serves it.  (void) keeps the helper referenced. */
+            /* swingby_capture_rt_to_snap was the old black GPU-blt snap writer —
+             * disabled on macOS 26 (GPU readback is black for Wine's CAMetalLayer).
+             * Kept referenced but unused. */
             (void)swingby_capture_rt_to_snap;
+
+            /* Synchronous handshake — mirrors the native GetRenderTargetData readback.
+             * The game is reading back a scene RT for a save thumbnail, but the GPU
+             * readback above is black on Metal.  Ask the macOS launcher to flush its
+             * latest SCK-captured scene to melammu_snap.bgra NOW and wait briefly, so
+             * the LockRect that immediately follows serves a fresh real-pixel snap via
+             * the surface.c RTDATA inject.  Event-driven (only on a save-thumbnail
+             * readback) and throttled to ~1/s, so a burst of slot readbacks triggers a
+             * single flush and there are NO continuous disk writes (jetsam-safe). */
+            if (dst_is_cmvs_readback)
+            {
+                static DWORD s_last_handshake;
+                DWORD now_hs = GetTickCount();
+                if (!s_last_handshake || (DWORD)(now_hs - s_last_handshake) > 1000)
+                {
+                    int i;
+                    FILE *rq = fopen("Z:\\tmp\\melammu_flush_request", "wb");
+                    if (rq) fclose(rq);
+                    for (i = 0; i < 40; i++) /* up to ~400ms for the launcher to flush */
+                    {
+                        FILE *chk = fopen("Z:\\tmp\\melammu_flush_request", "rb");
+                        if (!chk) break; /* launcher removed the request = flush done */
+                        fclose(chk);
+                        Sleep(10);
+                    }
+                    s_last_handshake = GetTickCount();
+                    { FILE *c = fopen("Z:\\tmp\\swingby_chain.txt","a"); /* TEMP chain trace */
+                      if (c) { fprintf(c,"handshake waited=%dms done=%d\n", i*10, i<40); fclose(c); } }
+                }
+            }
         }
         return hr;
     }
@@ -2493,6 +2533,10 @@ static void swingby_capture_frontbuffer(IDirect3DDevice9Ex *iface, struct d3d9_d
           { FILE *sf = fopen("Z:\\tmp\\melammu_save_screen_open", "wb"); if (sf) fclose(sf); }
           else
               remove("Z:\\tmp\\melammu_save_screen_open");
+          /* TEMP chain trace (ungated). */
+          { FILE *c = fopen("Z:\\tmp\\swingby_chain.txt","a");
+            if (c) { fprintf(c,"flag %s (cooldown=%u)\n", open_now?"RAISED":"cleared",
+                    swingby_save_screen_cooldown); fclose(c); } }
       } }
 }
 
@@ -2556,6 +2600,10 @@ static HRESULT WINAPI d3d9_device_SetRenderTarget(IDirect3DDevice9Ex *iface, DWO
                 {
                     swingby_save_screen_cooldown = 1800; /* launcher freeze marker */
                     swingby_thumb_cache_freeze   = 1800; /* ~30s at 60fps */
+                    /* TEMP chain trace (ungated): proves the save menu emits 336x300. */
+                    { static int once = 0; if (!once) { once = 1;
+                      FILE *c = fopen("Z:\\tmp\\swingby_chain.txt","a");
+                      if (c) { fprintf(c,"336x300 detected -> cooldown armed\n"); fclose(c); } } }
                 }
             }
 

@@ -58,7 +58,8 @@ feature probes and hashes.
 v1 `master` includes:
 
 - Core patches required by the current Melammu bundle.
-- `MELAMMU_CMVS_THUMBS` as a default-off engine gate.
+- `MELAMMU_D3D9_THUMB_READBACK` as a default-off engine gate
+  (`MELAMMU_CMVS_THUMBS` remains a legacy alias).
 
 v1 `master` excludes:
 
@@ -96,8 +97,8 @@ carried by the canonical branch.
 These patches must be default-off inside Wine and enabled by Melammu only for
 the engine/title policy that requires them.
 
-- CMVS thumbnail capture and last-presented back-buffer serving.
-- Gate: `MELAMMU_CMVS_THUMBS`.
+- D3D9 thumbnail readback capture and last-presented back-buffer serving.
+- Gate: `MELAMMU_D3D9_THUMB_READBACK` (`MELAMMU_CMVS_THUMBS` legacy alias).
 - IPC contract: `/tmp/melammu_snap_NNN.bgra` with
   `[u32 width][u32 height][u32 stride] + BGRA pixels`, plus
   `/tmp/melammu_page_base.txt`.

@@ -16,10 +16,11 @@ The supported Melammu runtime carries macOS/Rosetta compatibility work in
 `wow64cpu`, `ntdll`, `win32u`, and `winemac.drv`. These are not launcher
 features; they are Wine behavior fixes and belong in this fork.
 
-### `d3d9` / `wined3d` — CMVS thumbnail capture
+### `d3d9` / `wined3d` — D3D9 thumbnail readback
 
-CMVS save/load thumbnails are gated by `MELAMMU_CMVS_THUMBS` and must remain
-default-off for non-CMVS engines.
+Save/load thumbnail readback workarounds are gated by
+`MELAMMU_D3D9_THUMB_READBACK` and must remain default-off for non-target
+engines. `MELAMMU_CMVS_THUMBS` is still accepted as a legacy alias.
 
 The current mechanism serves the last-presented frame to back-buffer
 `LockRect(READONLY)` calls and uses Melammu-provided snapshot files only through

@@ -110,6 +110,8 @@ struct filter_graph
 
     struct list filters;
     unsigned int name_index;
+    BOOL melammu_logo_audio_to_null;
+    BOOL melammu_logo_video_to_null;
 
     FILTER_STATE state;
     TP_WORK *async_run_work;
@@ -1090,6 +1092,19 @@ static HRESULT create_filter(struct filter_graph *graph, IMoniker *moniker, IBas
 static HRESULT autoplug(struct filter_graph *graph, IPin *source, IPin *sink,
         BOOL render_to_existing, unsigned int recursion_depth);
 
+static BOOL melammu_graph_has_logo_filter(struct filter_graph *graph)
+{
+    struct filter *filter;
+
+    LIST_FOR_EACH_ENTRY(filter, &graph->filters, struct filter, entry)
+    {
+        if (!lstrcmpW(filter->name, L"Melammu Logo GStreamer splitter")
+                || !lstrcmpW(filter->name, L"Melammu Logo Audio Null Renderer"))
+            return TRUE;
+    }
+    return FALSE;
+}
+
 static HRESULT autoplug_through_sink(struct filter_graph *graph, IPin *source,
         IBaseFilter *filter, IPin *middle_sink, IPin *sink,
         BOOL render_to_existing, unsigned int recursion_depth)
@@ -1257,6 +1272,166 @@ out:
     return hr;
 }
 
+static BOOL melammu_env_enabled(const char *name)
+{
+    char value[8];
+    DWORD len;
+
+    len = GetEnvironmentVariableA(name, value, sizeof(value));
+    return len == 1 && value[0] == '1';
+}
+
+static BOOL melammu_is_logo_file(const WCHAR *filename)
+{
+    static const WCHAR backslash_suffix[] = L"movie\\logo.dat";
+    static const WCHAR slash_suffix[] = L"movie/logo.dat";
+    unsigned int len, suffix_len;
+
+    if (!filename)
+        return FALSE;
+
+    len = wcslen(filename);
+    suffix_len = ARRAY_SIZE(backslash_suffix) - 1;
+    if (len >= suffix_len && !lstrcmpiW(filename + len - suffix_len, backslash_suffix))
+        return TRUE;
+
+    suffix_len = ARRAY_SIZE(slash_suffix) - 1;
+    return len >= suffix_len && !lstrcmpiW(filename + len - suffix_len, slash_suffix);
+}
+
+static BOOL melammu_autoplug_types_include_audio(unsigned int type_count, const GUID *types)
+{
+    unsigned int i;
+
+    for (i = 0; i < type_count; ++i)
+    {
+        if (IsEqualGUID(&types[i * 2], &MEDIATYPE_Audio))
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL melammu_autoplug_types_include_video(unsigned int type_count, const GUID *types)
+{
+    unsigned int i;
+
+    for (i = 0; i < type_count; ++i)
+    {
+        if (IsEqualGUID(&types[i * 2], &MEDIATYPE_Video))
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL melammu_autoplug_types_include_stream(unsigned int type_count, const GUID *types)
+{
+    unsigned int i;
+
+    for (i = 0; i < type_count; ++i)
+    {
+        if (IsEqualGUID(&types[i * 2], &MEDIATYPE_Stream))
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL melammu_logo_route_enabled(struct filter_graph *graph)
+{
+    return graph->melammu_logo_audio_to_null || graph->melammu_logo_video_to_null;
+}
+
+static HRESULT melammu_autoplug_logo_stream(struct filter_graph *graph, IPin *source,
+        IPin *sink, BOOL render_to_existing, unsigned int recursion_depth)
+{
+    static const GUID CLSID_decodebin_parser =
+        {0xf9d8d64e,0xa144,0x47dc,{0x8e,0xe0,0xf5,0x34,0x98,0x37,0x2c,0x29}};
+    IBaseFilter *filter;
+    HRESULT hr;
+
+    if (FAILED(hr = CoCreateInstance(&CLSID_decodebin_parser, NULL, CLSCTX_INPROC_SERVER,
+            &IID_IBaseFilter, (void **)&filter)))
+    {
+        WARN("Melammu: failed to create logo GStreamer splitter, hr %#lx.\n", hr);
+        return hr;
+    }
+
+    if (FAILED(hr = IFilterGraph2_AddFilter(&graph->IFilterGraph2_iface, filter,
+            L"Melammu Logo GStreamer splitter")))
+    {
+        IBaseFilter_Release(filter);
+        return hr;
+    }
+
+    hr = autoplug_through_filter(graph, source, filter, sink, render_to_existing, recursion_depth);
+    if (FAILED(hr))
+        IFilterGraph2_RemoveFilter(&graph->IFilterGraph2_iface, filter);
+    else
+        FIXME("Melammu: routed logo stream through GStreamer splitter directly\n");
+
+    IBaseFilter_Release(filter);
+    return hr;
+}
+
+static HRESULT melammu_render_logo_audio_to_null(struct filter_graph *graph, IPin *source,
+        IPin *sink, BOOL render_to_existing, unsigned int recursion_depth)
+{
+    IBaseFilter *filter;
+    HRESULT hr;
+
+    if (FAILED(hr = CoCreateInstance(&CLSID_NullRenderer, NULL, CLSCTX_INPROC_SERVER,
+            &IID_IBaseFilter, (void **)&filter)))
+    {
+        WARN("Melammu: failed to create logo audio null renderer, hr %#lx.\n", hr);
+        return hr;
+    }
+
+    if (FAILED(hr = IFilterGraph2_AddFilter(&graph->IFilterGraph2_iface, filter,
+            L"Melammu Logo Audio Null Renderer")))
+    {
+        IBaseFilter_Release(filter);
+        return hr;
+    }
+
+    hr = autoplug_through_filter(graph, source, filter, sink, render_to_existing, recursion_depth);
+    if (FAILED(hr))
+        IFilterGraph2_RemoveFilter(&graph->IFilterGraph2_iface, filter);
+    else
+        FIXME("Melammu: routed logo audio pin to Null Renderer\n");
+
+    IBaseFilter_Release(filter);
+    return hr;
+}
+
+static HRESULT melammu_render_logo_video_to_null(struct filter_graph *graph, IPin *source,
+        IPin *sink, BOOL render_to_existing, unsigned int recursion_depth)
+{
+    IBaseFilter *filter;
+    HRESULT hr;
+
+    if (FAILED(hr = CoCreateInstance(&CLSID_NullRenderer, NULL, CLSCTX_INPROC_SERVER,
+            &IID_IBaseFilter, (void **)&filter)))
+    {
+        WARN("Melammu: failed to create logo video null renderer, hr %#lx.\n", hr);
+        return hr;
+    }
+
+    if (FAILED(hr = IFilterGraph2_AddFilter(&graph->IFilterGraph2_iface, filter,
+            L"Melammu Logo Video Null Renderer")))
+    {
+        IBaseFilter_Release(filter);
+        return hr;
+    }
+
+    hr = autoplug_through_filter(graph, source, filter, sink, render_to_existing, recursion_depth);
+    if (FAILED(hr))
+        IFilterGraph2_RemoveFilter(&graph->IFilterGraph2_iface, filter);
+    else
+        FIXME("Melammu: routed logo video pin to Null Renderer\n");
+
+    IBaseFilter_Release(filter);
+    return hr;
+}
+
 /* Common helper for IGraphBuilder::Connect() and IGraphBuilder::Render(), which
  * share most of the same code. Render() calls this with a NULL sink. */
 static HRESULT autoplug(struct filter_graph *graph, IPin *source, IPin *sink,
@@ -1292,6 +1467,38 @@ static HRESULT autoplug(struct filter_graph *graph, IPin *source, IPin *sink,
             return hr;
     }
 
+    if (melammu_logo_route_enabled(graph) && !sink
+            && SUCCEEDED(hr = get_autoplug_types(source, &type_count, &types)))
+    {
+        if (graph->melammu_logo_audio_to_null && melammu_autoplug_types_include_audio(type_count, types))
+        {
+            hr = melammu_render_logo_audio_to_null(graph, source, sink, render_to_existing, recursion_depth);
+            CoTaskMemFree(types);
+            return hr;
+        }
+
+        if (graph->melammu_logo_video_to_null && melammu_autoplug_types_include_video(type_count, types))
+        {
+            hr = melammu_render_logo_video_to_null(graph, source, sink, render_to_existing, recursion_depth);
+            CoTaskMemFree(types);
+            return hr;
+        }
+
+        if (melammu_autoplug_types_include_stream(type_count, types))
+        {
+            hr = melammu_autoplug_logo_stream(graph, source, sink, render_to_existing, recursion_depth);
+            CoTaskMemFree(types);
+            if (SUCCEEDED(hr))
+                return hr;
+            WARN("Melammu: direct logo stream autoplug failed, falling back to graph/filter mapper, hr %#lx.\n", hr);
+        }
+        else
+        {
+            CoTaskMemFree(types);
+        }
+        types = NULL;
+    }
+
     /* Always prefer filters in the graph. */
     LIST_FOR_EACH_ENTRY(graph_filter, &graph->filters, struct filter, entry)
     {
@@ -1306,6 +1513,29 @@ static HRESULT autoplug(struct filter_graph *graph, IPin *source, IPin *sink,
     {
         IFilterMapper2_Release(mapper);
         return hr;
+    }
+
+    if (graph->melammu_logo_audio_to_null && !sink
+            && melammu_autoplug_types_include_audio(type_count, types))
+    {
+        hr = melammu_render_logo_audio_to_null(graph, source, sink, render_to_existing, recursion_depth);
+        goto out;
+    }
+
+    if (graph->melammu_logo_video_to_null && !sink
+            && melammu_autoplug_types_include_video(type_count, types))
+    {
+        hr = melammu_render_logo_video_to_null(graph, source, sink, render_to_existing, recursion_depth);
+        goto out;
+    }
+
+    if (melammu_logo_route_enabled(graph) && !sink
+            && melammu_autoplug_types_include_stream(type_count, types))
+    {
+        hr = melammu_autoplug_logo_stream(graph, source, sink, render_to_existing, recursion_depth);
+        if (SUCCEEDED(hr))
+            goto out;
+        WARN("Melammu: direct logo stream autoplug failed, falling back to filter mapper, hr %#lx.\n", hr);
     }
 
     if (graph->pSite)
@@ -1447,15 +1677,34 @@ static HRESULT WINAPI FilterGraph2_RenderFile(IFilterGraph2 *iface, LPCWSTR lpcw
     HRESULT hr;
     BOOL partial = FALSE;
     BOOL any = FALSE;
+    BOOL old_melammu_logo_audio_to_null;
+    BOOL old_melammu_logo_video_to_null;
 
     TRACE("(%p/%p)->(%s, %s)\n", This, iface, debugstr_w(lpcwstrFile), debugstr_w(lpcwstrPlayList));
 
     if (lpcwstrPlayList != NULL)
         return E_INVALIDARG;
 
+    old_melammu_logo_audio_to_null = This->melammu_logo_audio_to_null;
+    old_melammu_logo_video_to_null = This->melammu_logo_video_to_null;
+    if (melammu_env_enabled("MELAMMU_LOGO_AUDIO_NULL") && melammu_is_logo_file(lpcwstrFile))
+    {
+        FIXME("Melammu: routing %s audio pins to Null Renderer\n", debugstr_w(lpcwstrFile));
+        This->melammu_logo_audio_to_null = TRUE;
+    }
+    if (melammu_env_enabled("MELAMMU_LOGO_VIDEO_NULL") && melammu_is_logo_file(lpcwstrFile))
+    {
+        FIXME("Melammu: routing %s video pins to Null Renderer\n", debugstr_w(lpcwstrFile));
+        This->melammu_logo_video_to_null = TRUE;
+    }
+
     hr = IFilterGraph2_AddSourceFilter(iface, lpcwstrFile, L"Reader", &preader);
     if (FAILED(hr))
+    {
+        This->melammu_logo_audio_to_null = old_melammu_logo_audio_to_null;
+        This->melammu_logo_video_to_null = old_melammu_logo_video_to_null;
         return hr;
+    }
 
     hr = IBaseFilter_EnumPins(preader, &penumpins);
     if (SUCCEEDED(hr))
@@ -1499,6 +1748,8 @@ static HRESULT WINAPI FilterGraph2_RenderFile(IFilterGraph2 *iface, LPCWSTR lpcw
     }
     IBaseFilter_Release(preader);
 
+    This->melammu_logo_audio_to_null = old_melammu_logo_audio_to_null;
+    This->melammu_logo_video_to_null = old_melammu_logo_video_to_null;
     TRACE("Returning %#lx.\n", hr);
     return hr;
 }
@@ -1802,11 +2053,18 @@ static HRESULT graph_start(struct filter_graph *graph, REFERENCE_TIME stream_sta
         stream_start = graph->stream_start - graph->stream_elapsed;
         /* Delay presentation time by 200 ms, to give filters time to
          * initialize. */
-        stream_start += 200 * 10000;
+        if (melammu_env_enabled("MELAMMU_LOGO_NO_START_DELAY") && melammu_graph_has_logo_filter(graph))
+            FIXME("Melammu: skipping logo graph 200ms start delay\n");
+        else
+            stream_start += 200 * 10000;
     }
 
     if (SUCCEEDED(IMediaSeeking_GetStopPosition(&graph->IMediaSeeking_iface, &stream_stop)))
         graph->stream_stop = stream_stop;
+
+    if (melammu_env_enabled("MELAMMU_TRACE_LOGO_RUN") && melammu_graph_has_logo_filter(graph))
+        FIXME("Melammu: logo graph run stream_start %s stream_elapsed %s\n",
+                wine_dbgstr_longlong(stream_start), wine_dbgstr_longlong(graph->stream_elapsed));
 
     LIST_FOR_EACH_ENTRY(filter, &graph->filters, struct filter, entry)
     {
