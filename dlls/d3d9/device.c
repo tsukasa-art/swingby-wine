@@ -31,6 +31,14 @@ static void STDMETHODCALLTYPE d3d9_null_wined3d_object_destroyed(void *parent) {
  * this is non-zero so /tmp/melammu_snap.bgra keeps the pre-save gameplay frame. */
 UINT swingby_save_screen_cooldown = 0;
 
+/* Set by SetRenderTarget when the Hamidashi normal-save menu renders its slot
+ * thumbnail into a 336x300 RT.  While non-zero the in-process scene cache
+ * (s_lastpres_frame, served by surface.c RTDATA inject) is frozen so the served
+ * save thumbnail keeps the pre-menu scene instead of the menu overlay.  This is
+ * Hamidashi-specific (the CMVS 192x108 path uses swingby_save_screen_cooldown
+ * and is intentionally left unchanged). */
+UINT swingby_thumb_cache_freeze = 0;
+
 /* Updated whenever /tmp/melammu_snap.bgra is written, regardless of capture path.
  * Surface LockRect injection can use this as a fallback when CMVS reads a
  * capture surface without a fresh GetRenderTargetData snap first. */
@@ -63,19 +71,32 @@ BOOL swingby_observe_only = FALSE;
 /* Incremented once per Present (in swingby_capture_frontbuffer). */
 UINT swingby_present_count = 0;
 
-/* ---- Master gate for the whole Melammu CMVS save-thumbnail capture system ----
+/* ---- Master gate for Melammu's D3D9 thumbnail readback workarounds ----
  * Default OFF.  When OFF, every Melammu d3d9 hook (per-Present back-buffer
  * capture, last-presented serve on READONLY locks, snap injection, all diag
  * logging) becomes a no-op, so d3d9.dll behaves exactly like the stock wine
- * builtin.  This is REQUIRED for non-CMVS engines: KiriKiri Z white-screened on
+ * builtin.  This is REQUIRED for non-target engines: KiriKiri Z white-screened on
  * wined3d because the always-on capture corrupted its normal back-buffer locks
  * (the failure was cross-backend — gl and vulkan both — because the corruption
  * lives in the d3d9 layer above wined3d, not in a wined3d backend).
  *
- * The Melammu launcher sets MELAMMU_CMVS_THUMBS=1 only for the CMVS EngineProfile,
- * where the save-thumbnail capture is actually needed (and CMVS already runs on
- * wined3d, not DXVK). */
+ * The Melammu launcher sets MELAMMU_D3D9_THUMB_READBACK=1 for readback-only
+ * cases like Hamidashi.  MELAMMU_CMVS_THUMBS remains accepted as a legacy alias
+ * and additionally enables the older per-Present capture path needed by CMVS. */
 BOOL swingby_capture_is_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *e = getenv("MELAMMU_D3D9_THUMB_READBACK");
+        if (!e || !e[0])
+            e = getenv("MELAMMU_CMVS_THUMBS");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+static BOOL swingby_present_capture_is_enabled(void)
 {
     static int cached = -1;
     if (cached < 0)
@@ -90,7 +111,7 @@ void swingby_diag(const char *fmt, ...)
 {
     FILE *f;
     va_list ap;
-    if (!swingby_capture_is_enabled())
+    if (!swingby_present_capture_is_enabled())
         return;
     f = fopen("Z:\\tmp\\swingby_diag.txt", "a");
     if (!f) return;
@@ -1980,7 +2001,6 @@ static HRESULT WINAPI d3d9_device_GetRenderTargetData(IDirect3DDevice9Ex *iface,
     struct wined3d_sub_resource_desc rt_desc, dst_desc;
     RECT dst_rect, src_rect;
     HRESULT hr;
-    BOOL dst_is_192x108;
     BOOL dst_is_cmvs_readback;
 
     TRACE("iface %p, render_target %p, dst_surface %p.\n", iface, render_target, dst_surface);
@@ -1992,7 +2012,6 @@ static HRESULT WINAPI d3d9_device_GetRenderTargetData(IDirect3DDevice9Ex *iface,
 
     wined3d_texture_get_sub_resource_desc(dst_impl->wined3d_texture, dst_impl->sub_resource_idx, &dst_desc);
     wined3d_texture_get_sub_resource_desc(rt_impl->wined3d_texture, rt_impl->sub_resource_idx, &rt_desc);
-    dst_is_192x108 = (dst_desc.width == 192 && dst_desc.height == 108);
     dst_is_cmvs_readback = (dst_desc.width >= 640 && dst_desc.height >= 400
             && (dst_desc.access & WINED3D_RESOURCE_ACCESS_CPU)
             && (dst_desc.access & WINED3D_RESOURCE_ACCESS_MAP_R));
@@ -2022,10 +2041,14 @@ static HRESULT WINAPI d3d9_device_GetRenderTargetData(IDirect3DDevice9Ex *iface,
             extern void swingby_on_get_render_target_data(IDirect3DSurface9 *s, IDirect3DSurface9 *d);
             swingby_on_get_render_target_data(render_target, dst_surface);
 
-            if (!swingby_observe_only && !dst_is_192x108)
-                /* Support Melammu's later persistence patch with the same RT pixels.
-                 * The live preview path itself is the direct RT -> dst_surface copy above. */
-                swingby_capture_rt_to_snap(iface, device, rt_impl);
+            /* DISABLED on macOS 26 (2026-06-29): swingby_capture_rt_to_snap GPU-blts
+             * the RT into melammu_snap.bgra, but GPU readback is black for Wine's
+             * CAMetalLayer.  Firing it here (the Hamidashi save GetRenderTargetData
+             * path) wrote a black snap at the exact save moment, clobbering the
+             * launcher's ScreenCaptureKit snap and feeding the RTDATA inject black.
+             * The launcher (LibraryViewModel.captureDisplaySCK) is the sole snap
+             * writer now; d3d9 only serves it.  (void) keeps the helper referenced. */
+            (void)swingby_capture_rt_to_snap;
         }
         return hr;
     }
@@ -2401,6 +2424,11 @@ static void swingby_capture_rt_to_snap(IDirect3DDevice9Ex *iface,
                 fclose(f);
                 melammu_snap_tick = now;
                 swingby_rt_snap_tick = now;
+                {
+                  extern void swingby_store_last_presented(const void *data, unsigned int pitch,
+                          unsigned int w, unsigned int h);
+                  swingby_store_last_presented(lr.pBits, (unsigned int)lr.Pitch, sd.Width, sd.Height);
+                }
                 { FILE *lg = fopen("Z:\\tmp\\swingby_lock.txt","a");
                   if (lg) { fprintf(lg,"RT_TO_SNAP ok %ux%u\n",sd.Width,sd.Height); fclose(lg); } }
             }
@@ -2411,117 +2439,61 @@ static void swingby_capture_rt_to_snap(IDirect3DDevice9Ex *iface,
     IDirect3DSurface9_Release(sys);
 }
 
-/* Capture the back buffer to an in-process last-good frame every Present.
- * The disk snap is still rate-limited; the hot path is for CMVS saves where the
- * scene can change immediately before the save menu reads its thumbnail RT. */
+/* Per-Present save-screen hook.
+ *
+ * On macOS 26 EVERY in-process capture path returns black for Wine's CAMetalLayer
+ * window: GPU readback/blt, GL readback, and CGWindowListCreateImage (via
+ * WineMacCaptureWindowPixelsBGRA).  The only real-pixel source is the macOS
+ * launcher's display-level ScreenCaptureKit grab (LibraryViewModel.captureDisplaySCK),
+ * which owns /tmp/melammu_snap.bgra.  So d3d9 NO LONGER captures or writes the snap
+ * itself — the previous per-Present writer only raced black frames over the
+ * launcher's good snap (root cause of the black save thumbnail, confirmed
+ * 2026-06-29 via RTDATA_*_INJECT avg_after=0 + snap avg 0).
+ *
+ * This hook now only: (a) decays the save-screen cooldowns, and (b) raises the
+ * `melammu_save_screen_open` flag on the open/close edge so the launcher flushes
+ * its pre-menu scene to the snap and freezes auto-capture.  The snap is served
+ * back into the thumbnail RT by the RTDATA inject in surface.c (s_lastpres_frame
+ * is never fed, so the inject falls through to the launcher snap). */
 static void swingby_capture_frontbuffer(IDirect3DDevice9Ex *iface, struct d3d9_device *device)
 {
-    static const char snap_trigger[] = "Z:\\tmp\\melammu_take_snap";
-    static const char snap_out[]     = "Z:\\tmp\\melammu_snap.bgra";
-    static const char snap_ready[]   = "Z:\\tmp\\melammu_snap_ready";
-    static UINT snap_file_frame = 0;
-    IDirect3DSurface9 *bb = NULL, *sys = NULL;
-    D3DSURFACE_DESC desc;
-    D3DLOCKED_RECT lr;
-    HRESULT hr;
-    FILE *f;
-    UINT row;
-    BOOL is_trigger;
-    BOOL write_snap;
+    (void)iface;
+    (void)device;
 
     if (!swingby_capture_is_enabled())
         return;
 
     swingby_present_count++;
 
+    /* Cooldowns decay once per Present.  save_screen_cooldown is the launcher
+     * freeze marker (set by CMVS 192x108 and Hamidashi 336x300 save screens). */
+    if (swingby_save_screen_cooldown > 0)
+        swingby_save_screen_cooldown--;
+    if (swingby_thumb_cache_freeze > 0)
+        swingby_thumb_cache_freeze--;
+
     if (swingby_observe_only)
     {
-        /* Observation build: no captures, no snap writes.  Keep the cooldown
-         * counter decaying so 192x108 markers stay meaningful, and emit a
-         * heartbeat so wall-clock time can be mapped to present frames. */
-        if (swingby_save_screen_cooldown > 0)
-            swingby_save_screen_cooldown--;
         if (!(swingby_present_count % 600))
-            swingby_diag("PRESENT heartbeat cooldown=%u", swingby_save_screen_cooldown);
+            swingby_diag("PRESENT heartbeat cooldown=%u freeze=%u",
+                    swingby_save_screen_cooldown, swingby_thumb_cache_freeze);
         return;
     }
 
-    /* The last-presented cache must update on EVERY Present — Windows keeps
-     * the presented frame in the back buffer regardless of which screen is
-     * showing, and CMVS re-captures whenever a save/load screen opens.  The
-     * old cooldown early-return (freezing a "pre-save" frame) is retired;
-     * cooldown now only decays as a save-screen activity marker. */
-    { FILE *t = fopen(snap_trigger, "rb");
-      if (t) { fclose(t); remove(snap_trigger); is_trigger = TRUE; write_snap = TRUE; snap_file_frame = 0; }
-      else {
-          if (swingby_save_screen_cooldown > 0)
-              swingby_save_screen_cooldown--;
-          is_trigger = FALSE;
-          write_snap = ++snap_file_frame >= 15;
-          if (write_snap)
-              snap_file_frame = 0;
+    /* Tell the macOS launcher to flush its pre-menu scene and freeze its
+     * display-capture auto-snap while a save/load screen is open, so the snap
+     * keeps the scene+ADV text, not the save-menu overlay.  cooldown > 0 means a
+     * 192x108 (CMVS) / 336x300 (Hamidashi) save-preview surface was seen. */
+    { static BOOL s_save_screen_flag = FALSE;
+      BOOL open_now = (swingby_save_screen_cooldown > 0);
+      if (open_now != s_save_screen_flag)
+      {
+          s_save_screen_flag = open_now;
+          if (open_now)
+          { FILE *sf = fopen("Z:\\tmp\\melammu_save_screen_open", "wb"); if (sf) fclose(sf); }
+          else
+              remove("Z:\\tmp\\melammu_save_screen_open");
       } }
-
-    if (!device->implicit_swapchain_count) return;
-
-    if (FAILED(d3d9_device_GetBackBuffer(iface, 0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)))
-        return;
-    IDirect3DSurface9_GetDesc(bb, &desc);
-
-    if (FAILED(d3d9_device_CreateOffscreenPlainSurface(iface, desc.Width, desc.Height,
-            desc.Format, D3DPOOL_SYSTEMMEM, &sys, NULL)))
-    {
-        IDirect3DSurface9_Release(bb);
-        return;
-    }
-
-    /* wined3d_device_context_blt reads directly from GPU memory; avoids the
-     * GetRenderTargetData hook that uses the CG compositor path (which sees
-     * through Wine's Metal window to the desktop behind it). */
-    { struct d3d9_surface *bb_impl  = unsafe_impl_from_IDirect3DSurface9(bb);
-      struct d3d9_surface *sys_impl = unsafe_impl_from_IDirect3DSurface9(sys);
-      RECT r;
-      SetRect(&r, 0, 0, desc.Width, desc.Height);
-      wined3d_mutex_lock();
-      hr = wined3d_device_context_blt(device->immediate_context,
-              sys_impl->wined3d_texture, sys_impl->sub_resource_idx, &r,
-              bb_impl->wined3d_texture,  bb_impl->sub_resource_idx,  &r,
-              0, NULL, WINED3D_TEXF_POINT);
-      wined3d_mutex_unlock(); }
-    IDirect3DSurface9_Release(bb);
-    if (FAILED(hr)) { IDirect3DSurface9_Release(sys); return; }
-
-    swingby_rt_capture_active = TRUE;
-    if (SUCCEEDED(IDirect3DSurface9_LockRect(sys, &lr, NULL, D3DLOCK_READONLY)))
-    {
-        /* Feed the in-process last-presented cache (Windows windowed-present
-         * copy semantics; served on back-buffer READONLY locks in surface.c). */
-        {
-            extern void swingby_store_last_presented(const void *data, unsigned int pitch,
-                    unsigned int w, unsigned int h);
-            swingby_store_last_presented(lr.pBits, (unsigned int)lr.Pitch, desc.Width, desc.Height);
-        }
-
-        if (write_snap)
-        {
-            f = fopen(snap_out, "wb");
-            if (f)
-            {
-                uint32_t w = desc.Width, h = desc.Height, s = (uint32_t)lr.Pitch;
-                fwrite(&w, 4, 1, f);
-                fwrite(&h, 4, 1, f);
-                fwrite(&s, 4, 1, f);
-                for (row = 0; row < desc.Height; row++)
-                    fwrite((char *)lr.pBits + (size_t)row * lr.Pitch, desc.Width * 4, 1, f);
-                fclose(f);
-                melammu_snap_tick = GetTickCount();
-                if (is_trigger) { f = fopen(snap_ready, "wb"); if (f) fclose(f); }
-            }
-        }
-        IDirect3DSurface9_UnlockRect(sys);
-    }
-    swingby_rt_capture_active = FALSE;
-    IDirect3DSurface9_Release(sys);
 }
 
 static HRESULT WINAPI d3d9_device_SetRenderTarget(IDirect3DDevice9Ex *iface, DWORD idx, IDirect3DSurface9 *surface)
@@ -2566,17 +2538,33 @@ static HRESULT WINAPI d3d9_device_SetRenderTarget(IDirect3DDevice9Ex *iface, DWO
         if (idx < 4)
         {
             static IDirect3DSurface9 *s_last_rt[4];
+            struct wined3d_sub_resource_desc d;
+            BOOL have_desc = FALSE;
+
+            if (surface_impl)
+            {
+                wined3d_texture_get_sub_resource_desc(surface_impl->wined3d_texture,
+                        surface_impl->sub_resource_idx, &d);
+                have_desc = TRUE;
+
+                /* Hamidashi normal-save menu renders its save-slot thumbnail into
+                 * a 336x300 RT (trace-confirmed; CMVS' equivalent is 192x108).
+                 * Arm the scene-cache freeze so swingby_capture_frontbuffer holds
+                 * the pre-menu scene while the menu is up.  Re-armed on every such
+                 * SetRenderTarget so a long-lingering menu stays frozen. */
+                if (d.width == 336 && d.height == 300)
+                {
+                    swingby_save_screen_cooldown = 1800; /* launcher freeze marker */
+                    swingby_thumb_cache_freeze   = 1800; /* ~30s at 60fps */
+                }
+            }
+
             if (surface != s_last_rt[idx])
             {
                 s_last_rt[idx] = surface;
-                if (surface_impl)
-                {
-                    struct wined3d_sub_resource_desc d;
-                    wined3d_texture_get_sub_resource_desc(surface_impl->wined3d_texture,
-                            surface_impl->sub_resource_idx, &d);
+                if (have_desc)
                     swingby_diag("SetRenderTarget idx=%lu surf=%p %ux%u acc=0x%x bind=0x%x",
                             idx, (void *)surface, d.width, d.height, d.access, d.bind_flags);
-                }
                 else
                     swingby_diag("SetRenderTarget idx=%lu surf=NULL", idx);
             }
