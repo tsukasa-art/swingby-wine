@@ -24,6 +24,8 @@
 
 #include <assert.h>
 #include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <math.h>	/* Insomnia - pow() function */
 
 #define COBJMACROS
@@ -41,6 +43,66 @@
 #include "fir.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(dsound);
+
+/* swingby: saturate the IEEE-float mix to [-1,1] before it reaches CoreAudio.
+ * Wine's float-output mix path (DSOUND_PerformMix below, when
+ * device->normfunction==NULL) writes the summed mix straight to the render
+ * buffer with NO clamping, unlike the integer path (norm16/etc. already clamp
+ * in dsound_convert.c). On macOS the shared mix format is IEEE_FLOAT, so when
+ * several DirectSound buffers (BGM + multiple SE) sum past unity the overflow
+ * reaches the CoreAudio AudioUnit unclamped and the hardware clips -> audible
+ * noise that worsens as more buffers mix. Saturating here mirrors what both the
+ * integer path and Windows' DirectSound mixer do. Always on: it only touches
+ * samples already out of [-1,1], so in-range audio is bit-identical. The
+ * counter is gated by MELAMMU_AUDIO_DIAG=1 (diagnosis only) and throttled to one
+ * line per 200 mix calls to stay well under the macOS per-process disk-write
+ * jetsam limit. (Hamidashi SE noise 2026-06-29: underrun ruled out by probe ->
+ * clip confirmed; this is the fix.) */
+static void swingby_clamp_float_mix(float *buf, unsigned int count)
+{
+	static int diag = -1;
+	unsigned int i;
+
+	if (diag < 0)
+	{
+		const char *e = getenv("MELAMMU_AUDIO_DIAG");
+		diag = (e && e[0] && e[0] != '0') ? 1 : 0;
+	}
+
+	if (!diag)
+	{
+		for (i = 0; i < count; i++)
+		{
+			if (buf[i] > 1.0f) buf[i] = 1.0f;
+			else if (buf[i] < -1.0f) buf[i] = -1.0f;
+		}
+		return;
+	}
+	else
+	{
+		static unsigned int tot_clamped, calls;
+		static float window_maxabs;
+		unsigned int clamped = 0;
+		FILE *f;
+
+		for (i = 0; i < count; i++)
+		{
+			float v = buf[i];
+			float a = v < 0.0f ? -v : v;
+			if (a > window_maxabs) window_maxabs = a;
+			if (v > 1.0f) { buf[i] = 1.0f; clamped++; }
+			else if (v < -1.0f) { buf[i] = -1.0f; clamped++; }
+		}
+		tot_clamped += clamped;
+		if ((++calls % 200) == 0 && (f = fopen("Z:\\tmp\\melammu_audio_diag.txt", "a")))
+		{
+			fprintf(f, "mix clamp @call%u: total_clamped_samples=%u window_maxabs=%.3f\n",
+					calls, tot_clamped, window_maxabs);
+			fclose(f);
+			window_maxabs = 0.0f;
+		}
+	}
+}
 
 void DSOUND_RecalcVolPan(PDSVOLUMEPAN volpan)
 {
@@ -745,8 +807,11 @@ static void DSOUND_PerformMix(DirectSoundDevice *device)
 
 		memset(buffer, nfiller, frames * block);
 
-		if (!device->normfunction)
+		if (!device->normfunction) {
 			DSOUND_MixToPrimary(device, buffer, frames, &all_stopped);
+			/* swingby: float-output path has no clamp; saturate to [-1,1]. */
+			swingby_clamp_float_mix((float *)buffer, frames * device->pwfx->nChannels);
+		}
 		else {
 			memset(device->buffer, nfiller, device->buflen);
 
