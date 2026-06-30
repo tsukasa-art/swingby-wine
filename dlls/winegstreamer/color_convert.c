@@ -374,8 +374,10 @@ done:
 static HRESULT WINAPI transform_GetOutputAvailableType(IMFTransform *iface, DWORD id, DWORD index,
         IMFMediaType **type)
 {
+    struct color_convert *impl = impl_from_IMFTransform(iface);
     IMFMediaType *media_type;
     const GUID *subtype;
+    UINT64 frame_size;
     HRESULT hr;
 
     TRACE("iface %p, id %#lx, index %#lx, type %p.\n", iface, id, index, type);
@@ -396,6 +398,18 @@ static HRESULT WINAPI transform_GetOutputAvailableType(IMFTransform *iface, DWOR
     if (FAILED(hr = IMFMediaType_SetUINT32(media_type, &MF_MT_FIXED_SIZE_SAMPLES, 1)))
         goto done;
     if (FAILED(hr = IMFMediaType_SetUINT32(media_type, &MF_MT_ALL_SAMPLES_INDEPENDENT, 1)))
+        goto done;
+
+    /* Propagate the frame size from the input type, when one is set, so downstream
+     * sinks that require it accept the offered type.  The EVR mixer in particular
+     * rejects video types without MF_MT_FRAME_SIZE (its DXVA2 video desc needs
+     * SampleWidth/SampleHeight), and the topology resolver offers these raw output
+     * available types directly when the sink cannot enumerate its own input types.
+     * Matches video_processor_GetOutputAvailableType; additive, so enumeration
+     * before SetInputType keeps its previous behaviour. */
+    if (impl->input_type
+            && SUCCEEDED(IMFMediaType_GetUINT64(impl->input_type, &MF_MT_FRAME_SIZE, &frame_size))
+            && FAILED(hr = IMFMediaType_SetUINT64(media_type, &MF_MT_FRAME_SIZE, frame_size)))
         goto done;
 
     IMFMediaType_AddRef((*type = media_type));
