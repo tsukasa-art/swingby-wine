@@ -41,6 +41,7 @@
 #include "wincon.h"
 #include "winternl.h"
 #include "wine/condrv.h"
+#include "msync.h"
 
 struct screen_buffer;
 
@@ -81,6 +82,7 @@ static const struct object_ops console_ops =
     console_add_queue,                /* add_queue */
     remove_queue,                     /* remove_queue */
     console_signaled,                 /* signaled */
+    NULL,                             /* get_msync_idx */
     no_satisfied,                     /* satisfied */
     no_signal,                        /* signal */
     console_get_fd,                   /* get_fd */
@@ -139,11 +141,13 @@ struct console_server
     unsigned int          once_input : 1; /* flag if input thread has already been requested */
     int                   term_fd;        /* UNIX terminal fd */
     struct termios        termios;        /* original termios */
+    unsigned int          msync_idx;
 };
 
 static void console_server_dump( struct object *obj, int verbose );
 static void console_server_destroy( struct object *obj );
 static int console_server_signaled( struct object *obj, struct wait_queue_entry *entry );
+static unsigned int console_server_get_msync_idx( struct object *obj, enum msync_type *type );
 static struct fd *console_server_get_fd( struct object *obj );
 static struct object *console_server_lookup_name( struct object *obj, struct unicode_str *name,
                                                 unsigned int attr, struct object *root );
@@ -158,6 +162,7 @@ static const struct object_ops console_server_ops =
     add_queue,                        /* add_queue */
     remove_queue,                     /* remove_queue */
     console_server_signaled,          /* signaled */
+    console_server_get_msync_idx,     /* get_msync_idx */
     no_satisfied,                     /* satisfied */
     no_signal,                        /* signal */
     console_server_get_fd,            /* get_fd */
@@ -227,6 +232,7 @@ static const struct object_ops screen_buffer_ops =
     screen_buffer_add_queue,          /* add_queue */
     NULL,                             /* remove_queue */
     NULL,                             /* signaled */
+    NULL,                             /* get_msync_idx */
     NULL,                             /* satisfied */
     no_signal,                        /* signal */
     screen_buffer_get_fd,             /* get_fd */
@@ -276,6 +282,7 @@ static const struct object_ops console_device_ops =
     no_add_queue,                     /* add_queue */
     NULL,                             /* remove_queue */
     NULL,                             /* signaled */
+    NULL,                             /* get_msync_idx */
     no_satisfied,                     /* satisfied */
     no_signal,                        /* signal */
     no_get_fd,                        /* get_fd */
@@ -313,6 +320,7 @@ static const struct object_ops console_input_ops =
     console_input_add_queue,          /* add_queue */
     NULL,                             /* remove_queue */
     NULL,                             /* signaled */
+    NULL,                             /* get_msync_idx */
     no_satisfied,                     /* satisfied */
     no_signal,                        /* signal */
     console_input_get_fd,             /* get_fd */
@@ -370,6 +378,7 @@ static const struct object_ops console_output_ops =
     console_output_add_queue,         /* add_queue */
     NULL,                             /* remove_queue */
     NULL,                             /* signaled */
+    NULL,                             /* get_msync_idx */
     no_satisfied,                     /* satisfied */
     no_signal,                        /* signal */
     console_output_get_fd,            /* get_fd */
@@ -428,6 +437,7 @@ static const struct object_ops console_connection_ops =
     no_add_queue,                     /* add_queue */
     NULL,                             /* remove_queue */
     NULL,                             /* signaled */
+    NULL,                             /* get_msync_idx */
     no_satisfied,                     /* satisfied */
     no_signal,                        /* signal */
     console_connection_get_fd,        /* get_fd */
@@ -590,6 +600,10 @@ static void disconnect_console_server( struct console_server *server )
         list_remove( &call->entry );
         console_host_ioctl_terminate( call, STATUS_CANCELLED );
     }
+
+    if (do_msync())
+        msync_clear_shm( server->msync_idx );
+
     while (!list_empty( &server->read_queue ))
     {
         struct console_host_ioctl *call = LIST_ENTRY( list_head( &server->read_queue ), struct console_host_ioctl, entry );
@@ -878,6 +892,7 @@ static void console_server_destroy( struct object *obj )
     assert( obj->ops == &console_server_ops );
     disconnect_console_server( server );
     if (server->fd) release_object( server->fd );
+    if (do_msync()) msync_destroy_semaphore( server->msync_idx );
 }
 
 static struct object *console_server_lookup_name( struct object *obj, struct unicode_str *name,
@@ -925,6 +940,13 @@ static int console_server_signaled( struct object *obj, struct wait_queue_entry 
     return !server->console || !list_empty( &server->queue );
 }
 
+static unsigned int console_server_get_msync_idx( struct object *obj, enum msync_type *type )
+{
+    struct console_server *server = (struct console_server*)obj;
+    *type = MSYNC_MANUAL_SERVER;
+    return server->msync_idx;
+}
+
 static struct fd *console_server_get_fd( struct object* obj )
 {
     struct console_server *server = (struct console_server*)obj;
@@ -956,6 +978,9 @@ static struct object *create_console_server( void )
         return NULL;
     }
     allow_fd_caching(server->fd);
+
+    if (do_msync())
+        server->msync_idx = msync_alloc_shm( 0, 0 );
 
     return &server->obj;
 }
@@ -1569,6 +1594,10 @@ DECL_HANDLER(get_next_console_request)
         /* set result of previous ioctl */
         ioctl = LIST_ENTRY( list_head( &server->queue ), struct console_host_ioctl, entry );
         list_remove( &ioctl->entry );
+
+        if (do_msync() && list_empty( &server->queue ))
+            msync_clear_shm( server->msync_idx );
+
     }
 
     if (ioctl)
@@ -1654,6 +1683,10 @@ DECL_HANDLER(get_next_console_request)
     {
         set_error( STATUS_PENDING );
     }
+
+    if (do_msync() && list_empty( &server->queue ))
+        msync_clear_shm( server->msync_idx );
+
 
     release_object( server );
 }

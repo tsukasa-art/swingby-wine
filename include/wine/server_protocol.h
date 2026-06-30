@@ -5882,6 +5882,92 @@ struct set_keyboard_repeat_reply
     char __pad_12[4];
 };
 
+enum msync_type
+{
+    MSYNC_SEMAPHORE = 1,
+    MSYNC_AUTO_EVENT,
+    MSYNC_MANUAL_EVENT,
+    MSYNC_MUTEX,
+    MSYNC_AUTO_SERVER,
+    MSYNC_MANUAL_SERVER,
+    MSYNC_QUEUE,
+};
+
+
+struct create_msync_request
+{
+    struct request_header __header;
+    unsigned int access;
+    int low;
+    int high;
+    int type;
+    /* VARARG(objattr,object_attributes); */
+    char __pad_28[4];
+};
+struct create_msync_reply
+{
+    struct reply_header __header;
+    obj_handle_t handle;
+    int type;
+    unsigned int shm_idx;
+    char __pad_20[4];
+};
+
+
+struct open_msync_request
+{
+    struct request_header __header;
+    unsigned int access;
+    unsigned int attributes;
+    obj_handle_t rootdir;
+    int          type;
+    /* VARARG(name,unicode_str); */
+    char __pad_28[4];
+};
+struct open_msync_reply
+{
+    struct reply_header __header;
+    obj_handle_t handle;
+    int          type;
+    unsigned int shm_idx;
+    char __pad_20[4];
+};
+
+
+struct get_msync_idx_request
+{
+    struct request_header __header;
+    obj_handle_t handle;
+};
+struct get_msync_idx_reply
+{
+    struct reply_header __header;
+    int          type;
+    unsigned int shm_idx;
+};
+
+struct msync_msgwait_request
+{
+    struct request_header __header;
+    int          in_msgwait;
+};
+struct msync_msgwait_reply
+{
+    struct reply_header __header;
+};
+
+struct get_msync_apc_idx_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+};
+struct get_msync_apc_idx_reply
+{
+    struct reply_header __header;
+    unsigned int shm_idx;
+    char __pad_12[4];
+};
+
 
 enum request
 {
@@ -6177,6 +6263,11 @@ enum request
     REQ_resume_process,
     REQ_get_next_thread,
     REQ_set_keyboard_repeat,
+    REQ_create_msync,
+    REQ_open_msync,
+    REQ_get_msync_idx,
+    REQ_msync_msgwait,
+    REQ_get_msync_apc_idx,
     REQ_NB_REQUESTS
 };
 
@@ -6476,6 +6567,11 @@ union generic_request
     struct resume_process_request resume_process_request;
     struct get_next_thread_request get_next_thread_request;
     struct set_keyboard_repeat_request set_keyboard_repeat_request;
+    struct create_msync_request create_msync_request;
+    struct open_msync_request open_msync_request;
+    struct get_msync_idx_request get_msync_idx_request;
+    struct msync_msgwait_request msync_msgwait_request;
+    struct get_msync_apc_idx_request get_msync_apc_idx_request;
 };
 union generic_reply
 {
@@ -6773,8 +6869,13 @@ union generic_reply
     struct resume_process_reply resume_process_reply;
     struct get_next_thread_reply get_next_thread_reply;
     struct set_keyboard_repeat_reply set_keyboard_repeat_reply;
+    struct create_msync_reply create_msync_reply;
+    struct open_msync_reply open_msync_reply;
+    struct get_msync_idx_reply get_msync_idx_reply;
+    struct msync_msgwait_reply msync_msgwait_reply;
+    struct get_msync_apc_idx_reply get_msync_apc_idx_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 855
+#define SERVER_PROTOCOL_VERSION 856
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

@@ -35,6 +35,7 @@
 #include "thread.h"
 #include "request.h"
 #include "security.h"
+#include "msync.h"
 
 static const WCHAR event_name[] = {'E','v','e','n','t'};
 
@@ -56,11 +57,13 @@ struct event
     struct list    kernel_object;   /* list of kernel object pointers */
     int            manual_reset;    /* is it a manual reset event? */
     int            signaled;        /* event has been signaled */
+    unsigned int   msync_idx;
 };
 
 static void event_dump( struct object *obj, int verbose );
 static int event_signaled( struct object *obj, struct wait_queue_entry *entry );
 static void event_satisfied( struct object *obj, struct wait_queue_entry *entry );
+static unsigned int event_get_msync_idx( struct object *obj, enum msync_type *type );
 static int event_signal( struct object *obj, unsigned int access);
 static struct list *event_get_kernel_obj_list( struct object *obj );
 
@@ -72,6 +75,7 @@ static const struct object_ops event_ops =
     add_queue,                 /* add_queue */
     remove_queue,              /* remove_queue */
     event_signaled,            /* signaled */
+    event_get_msync_idx,       /* get_msync_idx */
     event_satisfied,           /* satisfied */
     event_signal,              /* signal */
     no_get_fd,                 /* get_fd */
@@ -119,6 +123,7 @@ static const struct object_ops keyed_event_ops =
     add_queue,                   /* add_queue */
     remove_queue,                /* remove_queue */
     keyed_event_signaled,        /* signaled */
+    NULL,                        /* get_msync_idx */
     no_satisfied,                /* satisfied */
     no_signal,                   /* signal */
     no_get_fd,                   /* get_fd */
@@ -150,6 +155,9 @@ struct event *create_event( struct object *root, const struct unicode_str *name,
             list_init( &event->kernel_object );
             event->manual_reset = manual_reset;
             event->signaled     = initial_state;
+
+            if (do_msync())
+                event->msync_idx = msync_alloc_shm( initial_state, 0 );
         }
     }
     return event;
@@ -157,6 +165,10 @@ struct event *create_event( struct object *root, const struct unicode_str *name,
 
 struct event *get_event_obj( struct process *process, obj_handle_t handle, unsigned int access )
 {
+    struct object *obj;
+    if (do_msync() && (obj = get_handle_obj( process, handle, access, &msync_ops)))
+        return (struct event *)obj; /* even though it's not an event */
+
     return (struct event *)get_handle_obj( process, handle, access, &event_ops );
 }
 
@@ -166,10 +178,19 @@ static void pulse_event( struct event *event )
     /* wake up all waiters if manual reset, a single one otherwise */
     wake_up( &event->obj, !event->manual_reset );
     event->signaled = 0;
+
+    if (do_msync())
+        msync_clear( &event->obj );
 }
 
 void set_event( struct event *event )
 {
+    if (do_msync() && event->obj.ops == &msync_ops)
+    {
+        msync_set_event( (struct msync *)event );
+        return;
+    }
+
     event->signaled = 1;
     /* wake up all waiters if manual reset, a single one otherwise */
     wake_up( &event->obj, !event->manual_reset );
@@ -177,7 +198,16 @@ void set_event( struct event *event )
 
 void reset_event( struct event *event )
 {
+    if (do_msync() && event->obj.ops == &msync_ops)
+    {
+        msync_reset_event( (struct msync *)event );
+        return;
+    }
+
     event->signaled = 0;
+
+    if (do_msync())
+        msync_clear( &event->obj );
 }
 
 static void event_dump( struct object *obj, int verbose )
@@ -193,6 +223,13 @@ static int event_signaled( struct object *obj, struct wait_queue_entry *entry )
     struct event *event = (struct event *)obj;
     assert( obj->ops == &event_ops );
     return event->signaled;
+}
+
+static unsigned int event_get_msync_idx( struct object *obj, enum msync_type *type )
+{
+    struct event *event = (struct event *)obj;
+    *type = MSYNC_MANUAL_SERVER;
+    return event->msync_idx;
 }
 
 static void event_satisfied( struct object *obj, struct wait_queue_entry *entry )
@@ -221,6 +258,14 @@ static struct list *event_get_kernel_obj_list( struct object *obj )
 {
     struct event *event = (struct event *)obj;
     return &event->kernel_object;
+}
+
+static void event_destroy( struct object *obj )
+{
+    struct event *event = (struct event *)obj;
+
+    if (do_msync())
+        msync_destroy_semaphore( event->msync_idx );
 }
 
 struct keyed_event *create_keyed_event( struct object *root, const struct unicode_str *name,
