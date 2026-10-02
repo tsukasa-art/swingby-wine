@@ -11334,7 +11334,8 @@ static unsigned int shader_glsl_get_shader_model(const struct wined3d_gl_info *g
     BOOL shader_model_4 = gl_info->glsl_version >= MAKEDWORD_VERSION(1, 50)
             && gl_info->supported[ARB_SHADER_BIT_ENCODING]
             && gl_info->supported[ARB_TEXTURE_SWIZZLE]
-            && gl_info->supported[EXT_SHADER_INTEGER_MIX];
+            && (gl_info->supported[EXT_SHADER_INTEGER_MIX]
+                    || gl_info->supported[APPLE_FLUSH_RENDER]);
 
     if (shader_model_4
             && gl_info->supported[ARB_COMPUTE_SHADER]

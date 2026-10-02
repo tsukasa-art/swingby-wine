@@ -1248,8 +1248,18 @@ static enum wined3d_feature_level feature_level_from_caps(const struct wined3d_g
     shader_model = min(shader_model, max(shader_caps->hs_version, 4));
     shader_model = min(shader_model, max(shader_caps->ds_version, 4));
 
+    /*
+     * Apple's OpenGL 4.1 implementation has no polygon offset clamp
+     * extension. Requiring it here caps otherwise SM4-capable Macs at
+     * feature level 9_3, which prevents Direct2D from creating its required
+     * 10_0 device context. CrossOver's Wine 7.7 macOS tree deliberately
+     * omits this requirement; ffp_gl.c already treats depth_bias_clamp as
+     * optional when the extension is unavailable. Keep the newer upstream
+     * requirement for non-Apple drivers.
+     */
     if (gl_info->supported[WINED3D_GL_VERSION_3_2]
-            && gl_info->supported[ARB_POLYGON_OFFSET_CLAMP]
+            && (gl_info->supported[ARB_POLYGON_OFFSET_CLAMP]
+                    || gl_info->supported[APPLE_FLUSH_RENDER])
             && gl_info->supported[ARB_SAMPLER_OBJECTS])
     {
         if (shader_model >= 5
