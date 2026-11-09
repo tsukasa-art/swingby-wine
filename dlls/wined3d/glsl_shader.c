@@ -12720,6 +12720,13 @@ static void glsl_blitter_generate_yuv_shader(struct wined3d_string_buffer *buffe
      * http://www.fourcc.org/fccyvrgb.php. Note that the chroma
      * ranges from -0.5 to 0.5. */
     shader_addline(buffer, "\n    chroma.xy -= 0.5;\n");
+    /* Swingby: D3D9 YUV surfaces carry studio-range (BT.601 limited, Y 16-235,
+     * C 16-240) video. Expand it like the CPU path does
+     * (surface.c convert_yuy2_x8r8g8b8: C = Y - 16, 298/256). Without this,
+     * video black (Y=16) is shown as RGB 16 instead of 0 and white stays dim,
+     * e.g. EVR/DXVA2 StretchRect YUY2 -> RGB for movie playback. */
+    shader_addline(buffer, "    luminance = (luminance - 16.0 / 255.0) * (255.0 / 219.0);\n");
+    shader_addline(buffer, "    chroma.xy *= 255.0 / 224.0;\n");
 
     shader_addline(buffer, "    %s.x = luminance + chroma.x * yuv_coef.x;\n", output);
     shader_addline(buffer, "    %s.y = luminance + chroma.y * yuv_coef.y + chroma.x * yuv_coef.z;\n", output);
