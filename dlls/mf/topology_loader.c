@@ -280,7 +280,6 @@ static HRESULT topology_branch_connect_indirect(IMFTopology *topology, MF_CONNEC
     IMFTopologyNode *node;
     unsigned int i, count;
     GUID category, guid;
-    UINT32 enable_xvp;
     HRESULT hr;
 
     TRACE("topology %p, method_mask %#x, branch %s, up_type %p, down_type %p.\n",
@@ -300,15 +299,10 @@ static HRESULT topology_branch_connect_indirect(IMFTopology *topology, MF_CONNEC
             return hr;
     }
 
-    if (FAILED(IMFTopology_GetUINT32(topology, &MF_TOPOLOGY_ENABLE_XVP_FOR_PLAYBACK, &enable_xvp)))
-        enable_xvp = 0;
-
     if (IsEqualGUID(&input_info.guidMajorType, &MFMediaType_Audio))
         category = decoder ? MFT_CATEGORY_AUDIO_DECODER : MFT_CATEGORY_AUDIO_EFFECT;
     else if (IsEqualGUID(&input_info.guidMajorType, &MFMediaType_Video))
-        category = decoder ? MFT_CATEGORY_VIDEO_DECODER
-                : enable_xvp ? MFT_CATEGORY_VIDEO_PROCESSOR
-                : MFT_CATEGORY_VIDEO_EFFECT;
+        category = decoder ? MFT_CATEGORY_VIDEO_DECODER : MFT_CATEGORY_VIDEO_PROCESSOR;
     else
         return MF_E_INVALIDMEDIATYPE;
 
@@ -337,8 +331,7 @@ static HRESULT topology_branch_connect_indirect(IMFTopology *topology, MF_CONNEC
 
         IMFTopologyNode_SetObject(node, (IUnknown *)transform);
         IMFTopologyNode_DeleteItem(node, &MF_TOPONODE_TRANSFORM_OBJECTID);
-        if (SUCCEEDED(IMFActivate_GetGUID(activates[i], &MFT_TRANSFORM_CLSID_Attribute, &guid))
-                && !IsEqualGUID(&guid, &CLSID_VideoProcessorMFT))
+        if (SUCCEEDED(IMFActivate_GetGUID(activates[i], &MFT_TRANSFORM_CLSID_Attribute, &guid)))
             IMFTopologyNode_SetGUID(node, &MF_TOPONODE_TRANSFORM_OBJECTID, &guid);
 
         hr = topology_branch_connect_down(topology, MF_CONNECT_DIRECT, &up_branch, up_type);
