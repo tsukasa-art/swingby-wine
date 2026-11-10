@@ -1593,8 +1593,22 @@ static HRESULT audio_renderer_create_audio_client(struct audio_renderer *rendere
         return hr;
     }
 
-    /* FIXME: for now always use default format. */
-    if (FAILED(hr = IAudioClient_GetMixFormat(renderer->audio_client, &wfx)))
+    /* Swingby: open the client with the format of the samples we will
+     * actually receive. check_media_type() only matches rate, channels, bits,
+     * block alignment and byte rate against the mix format, so 32-bit integer
+     * PCM at the device rate (e.g. 24-bit WMA Lossless decoded to S32) is
+     * accepted as is; initializing with the float mix format then played the
+     * integer samples as float (loud noise). Shared-mode clients convert PCM
+     * to the mix format themselves. Fall back to the mix format otherwise. */
+    wfx = NULL;
+    if (renderer->current_media_type)
+    {
+        UINT32 size;
+
+        if (FAILED(MFCreateWaveFormatExFromMFMediaType(renderer->current_media_type, &wfx, &size, 0)))
+            wfx = NULL;
+    }
+    if (!wfx && FAILED(hr = IAudioClient_GetMixFormat(renderer->audio_client, &wfx)))
     {
         WARN("Failed to get audio format, hr %#lx.\n", hr);
         return hr;
