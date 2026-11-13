@@ -69,6 +69,7 @@ messages, source attribution, and direct code review.
 | 11b | `1ae2460` | `dlls/quartz/filtergraph.c`, `dsoundrender.c` | Gate startup-logo and movie pre-roll behavior | [first-load lifecycle](https://tsukasa-art.com/projects/orrery/notes/movie-first-load-after-app-update/) | Title Gated |
 | 12 | `6c217e5` | `dlls/winecoreaudio.drv/coreaudio.c` | Prefer the system-default endpoint with stock enumeration as fallback | — | Shared |
 | 13 | `1471f547fba` | `dlls/ddraw/surface.c` | Intersect an out-of-bounds destination and proportionally crop the source | — | High-risk shared change; limited to verified routes |
+| 14 | `7de1f62f3d7` | `dlls/ntdll/unix/system.c` | Default-off `SWINGBY_CPU_LIMIT=<n>` caps the processor count reported to a process (and the affinity masks / logical processor information derived from it), for titles whose CPU-side work drops writes on many-core hosts | — | Engine / Title Gated |
 
 ## ②-B Attributed conceptual port / non-verbatim reimplementation
 
