@@ -1401,6 +1401,25 @@ void init_cpu_info(void)
     num = 1;
     FIXME("Detecting the number of processors is not supported.\n");
 #endif
+    /* swingby-wine: default-off per-title gate. SWINGBY_CPU_LIMIT=<n> caps the
+     * processor count reported to the process (and everything derived from it:
+     * affinity masks, logical processor info). Some titles split CPU-side work by
+     * the reported count and drop writes on many-core hosts. */
+    {
+        const char *limit = getenv( "SWINGBY_CPU_LIMIT" );
+        if (limit && *limit)
+        {
+            char *end;
+            long n = strtol( limit, &end, 10 );
+            if (*end || n < 1)
+                WARN( "Ignoring invalid SWINGBY_CPU_LIMIT=%s.\n", debugstr_a(limit) );
+            else if (n < num)
+            {
+                TRACE( "SWINGBY_CPU_LIMIT: reporting %ld of %ld processors.\n", n, num );
+                num = n;
+            }
+        }
+    }
     peb->NumberOfProcessors = cpu_info.MaximumProcessors = num;
     get_cpuinfo( &cpu_info );
     TRACE( "<- CPU arch %d, level %d, rev %d, features 0x%x\n",
