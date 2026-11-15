@@ -4,8 +4,9 @@
 
 **Swingby Wine** (repository: `swingby-wine`) is the public Wine fork used by **Melammu**, the private
 launcher at the core of [Orrery](https://tsukasa-art.com/projects/orrery/).
-Orrery is a compatibility and library project for running Windows visual
-novels as Mac applications without modifying the games themselves.
+Orrery is a compatibility and management platform that combines the KASANE
+macOS launcher (development name: Melammu) with the **Swingby** Windows-game
+compatibility layer. Swingby consists of Swingby Wine and Swingby DXVK.
 
 The fork is based directly on the [WineHQ](https://gitlab.winehq.org/wine/wine)
 **Wine 10.0 release** (`b0738596`). This repository is the canonical source for

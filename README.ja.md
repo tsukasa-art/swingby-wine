@@ -5,6 +5,8 @@
 **Swingby Wine**（repository: `swingby-wine`）は、Orreryの非公開ランチャー本体**Melammu**で利用する、
 Apple Silicon Mac向けの公開Wine forkです。Windows向けビジュアルノベルをゲーム本体の
 実行ファイルやデータを書き換えず、Macアプリとして扱うための互換処理を実装しています。
+OrreryはmacOSランチャーのKASANE（開発名 Melammu）とWindowsゲーム互換レイヤー**Swingby**を組み合わせた互換・管理基盤で、
+SwingbyはSwingby WineとSwingby DXVKから構成されます。
 
 [WineHQ Wine 10.0](https://gitlab.winehq.org/wine/wine)のrelease
 `b0738596`を直接のbaseとし、macOS / Rosetta 2向けのWine-side patchをこのrepoで
